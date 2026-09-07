@@ -1,4 +1,5 @@
 import jwt from 'jsonwebtoken';
+import crypto from 'crypto';
 import { getEnv } from '@/config';
 
 export interface JwtPayload {
@@ -16,7 +17,17 @@ export function signAccessToken(payload: JwtPayload): string {
 
 export function signRefreshToken(payload: JwtPayload): string {
   const env = getEnv();
-  return jwt.sign(payload, env.JWT_SECRET, { expiresIn: env.JWT_REFRESH_TTL as any });
+  // `jti` makes every refresh token unique. JWT's own `iat` claim has
+  // one-second resolution, so two tokens signed for the same user within the
+  // same second came out byte-identical — and refresh_tokens.token_hash is
+  // UNIQUE, so the second insert failed with 23505. That bit any flow issuing
+  // a token twice in quick succession (changing a password, or logging in
+  // again immediately after).
+  return jwt.sign(
+    { ...payload, jti: crypto.randomUUID() },
+    env.JWT_SECRET,
+    { expiresIn: env.JWT_REFRESH_TTL as any }
+  );
 }
 
 export function verifyToken(token: string): JwtPayload {

@@ -136,15 +136,35 @@ router.post('/change-password', authenticate, requirePlatform, async (req: Reque
       [newHash, adminId]
     );
 
-    // Revoke all refresh tokens for this user
+    // Revoke every existing refresh token: a password change should end any
+    // session opened with the old password, on any device.
     await pool.query(
       'UPDATE refresh_tokens SET revoked_at = now() WHERE owner_type = $1 AND owner_id = $2 AND revoked_at IS NULL',
       ['platform', adminId]
     );
 
+    // ...except the session doing the changing — see the matching note in
+    // staffAuth. Without a fresh pair the next refresh fails and the admin is
+    // thrown back to the login screen right after setting their password.
+    const tokenPayload = { sub: adminId, type: 'platform' as const };
+    const accessToken = signAccessToken(tokenPayload);
+    const refreshToken = signRefreshToken(tokenPayload);
+
+    const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
+    const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+    await pool.query(
+      'INSERT INTO refresh_tokens (owner_type, owner_id, token_hash, expires_at) VALUES ($1, $2, $3, $4)',
+      ['platform', adminId, tokenHash, expiresAt]
+    );
+
     res.json({
       ok: true,
-      data: { message: 'Password changed successfully' },
+      data: {
+        message: 'Password changed successfully',
+        access_token: accessToken,
+        refresh_token: refreshToken,
+        must_change_password: false,
+      },
     });
   } catch (err) {
     next(err);

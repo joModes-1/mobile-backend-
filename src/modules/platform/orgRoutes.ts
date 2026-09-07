@@ -6,8 +6,33 @@ import { createAppError } from '@/middleware/errorHandler';
 import { authenticate } from '@/middleware/auth';
 import { requirePlatform } from '@/middleware/requirePlatform';
 import { generateTempPassword } from '@/utils/tempPassword';
+import { sendStaffTempPasswordEmail } from '@/utils/email';
 
 const router = Router();
+
+/**
+ * Email a new admin their temporary password.
+ *
+ * Never throws: the account has already been created by the time this runs,
+ * so a mail failure must not turn a successful creation into an error. The
+ * caller reports whether it went out, and the password stays in the response
+ * either way so the sysadmin can always fall back to reading it out.
+ */
+async function tryEmailTempPassword(
+  email: string,
+  fullName: string,
+  username: string,
+  tempPassword: string,
+  reason: 'created' | 'reset'
+): Promise<boolean> {
+  try {
+    await sendStaffTempPasswordEmail(email, fullName, username, tempPassword, reason);
+    return true;
+  } catch (err) {
+    console.error(`[email] temp password to ${email} failed:`, err);
+    return false;
+  }
+}
 
 // All routes require platform auth
 router.use(authenticate, requirePlatform);
@@ -108,7 +133,7 @@ router.get('/orgs', async (req: Request, res: Response, next: NextFunction) => {
         p.id AS plan_id, p.code AS plan_code, p.name AS plan_name,
         p.price_ugx AS plan_price_ugx, p.billing_cycle, p.max_branches,
         (SELECT COUNT(*) FROM branches WHERE org_id = o.id) as branch_count,
-        (SELECT COUNT(*) FROM staff_users WHERE org_id = o.id) as staff_count,
+        (SELECT COUNT(*) FROM staff_users WHERE org_id = o.id AND status = 'active') as staff_count,
         (SELECT COUNT(*) FROM clients WHERE org_id = o.id) as client_count,
         (SELECT COUNT(*) FROM washes w
            WHERE w.org_id = o.id AND w.status = 'settled'
@@ -177,14 +202,26 @@ router.post('/orgs', async (req: Request, res: Response, next: NextFunction) => 
 
       await client.query('COMMIT');
 
-      // Return temp password once
+      // Email the credentials to the new admin. staffRoutes has always done
+      // this for staff it creates; the platform routes did not, so an org
+      // admin created here only ever learned their password if the sysadmin
+      // read it off the screen and passed it on by hand.
+      // After COMMIT, and non-fatal: the organisation exists either way, and
+      // the password is still returned below as the fallback.
+      const emailed = await tryEmailTempPassword(
+        data.admin_email, data.admin_name, data.admin_email.split('@')[0], tempPassword, 'created'
+      );
+
       res.status(201).json({
         ok: true,
         data: {
           org_id: orgId,
           admin_id: adminResult.rows[0].id,
           temp_password: tempPassword,
-          message: 'Organization created. Share the temp password with the admin. It will not be shown again.',
+          emailed,
+          message: emailed
+            ? `Organization created. The temporary password was emailed to ${data.admin_email}.`
+            : 'Organization created. Share the temp password with the admin. It will not be shown again.',
         },
       });
     } catch (err) {
@@ -217,7 +254,7 @@ router.get('/orgs/:id', async (req: Request, res: Response, next: NextFunction) 
         p.code AS plan_code, p.name AS plan_name, p.price_ugx AS plan_price_ugx,
         p.billing_cycle, p.max_branches,
         (SELECT COUNT(*) FROM branches WHERE org_id = o.id) as branch_count,
-        (SELECT COUNT(*) FROM staff_users WHERE org_id = o.id) as staff_count,
+        (SELECT COUNT(*) FROM staff_users WHERE org_id = o.id AND status = 'active') as staff_count,
         (SELECT COUNT(*) FROM clients WHERE org_id = o.id) as client_count,
         (SELECT COUNT(*) FROM washes w WHERE w.org_id = o.id AND w.status = 'settled') AS washes_total,
         (SELECT COUNT(*) FROM washes w
@@ -244,7 +281,7 @@ router.get('/orgs/:id', async (req: Request, res: Response, next: NextFunction) 
     // Get branches with counts
     const branches = await pool.query(
       `SELECT id, name, code, status,
-        (SELECT COUNT(*) FROM staff_users WHERE branch_id = branches.id) as staff_count
+        (SELECT COUNT(*) FROM staff_users WHERE branch_id = branches.id AND status = 'active') as staff_count
        FROM branches WHERE org_id = $1 ORDER BY name`,
       [id]
     );
@@ -446,12 +483,19 @@ router.post('/orgs/:id/admins', async (req: Request, res: Response, next: NextFu
       [id, req.actor!.sub, result.rows[0].id, JSON.stringify({ email: data.email, role: 'orgadmin' })]
     );
 
+    const emailed = await tryEmailTempPassword(
+      data.email, data.full_name, data.email.split('@')[0], tempPassword, 'created'
+    );
+
     res.status(201).json({
       ok: true,
       data: {
         admin_id: result.rows[0].id,
         temp_password: tempPassword,
-        message: 'Orgadmin created. Share the temp password. It will not be shown again.',
+        emailed,
+        message: emailed
+          ? `Orgadmin created. The temporary password was emailed to ${data.email}.`
+          : 'Orgadmin created. Share the temp password. It will not be shown again.',
       },
     });
   } catch (err) {
@@ -504,13 +548,20 @@ router.post('/admins', async (req: Request, res: Response, next: NextFunction) =
       [data.full_name, username, data.email, data.phone || null, passwordHash]
     );
 
+    const emailed = await tryEmailTempPassword(
+      data.email, data.full_name, username, tempPassword, 'created'
+    );
+
     res.status(201).json({
       ok: true,
       data: {
         admin_id: result.rows[0].id,
         username,
         temp_password: tempPassword,
-        message: 'Admin created. Share the temp password. It will not be shown again.',
+        emailed,
+        message: emailed
+          ? `Admin created. The temporary password was emailed to ${data.email}.`
+          : 'Admin created. Share the temp password. It will not be shown again.',
       },
     });
   } catch (err) {
@@ -533,12 +584,17 @@ router.post('/admins/:id/reset-password', async (req: Request, res: Response, ne
       return;
     }
 
-    // Check target exists
-    const target = await pool.query('SELECT id FROM platform_admins WHERE id = $1', [id]);
+    // Check target exists. Name/username/email come back too so the new
+    // password can be emailed rather than read off a screen.
+    const target = await pool.query(
+      'SELECT id, full_name, username, email FROM platform_admins WHERE id = $1',
+      [id]
+    );
     if (target.rows.length === 0) {
       next(createAppError(404, 'NOT_FOUND', 'Admin not found'));
       return;
     }
+    const targetAdmin = target.rows[0];
 
     const tempPassword = generateTempPassword();
     const passwordHash = await argon2.hash(tempPassword);
@@ -554,11 +610,18 @@ router.post('/admins/:id/reset-password', async (req: Request, res: Response, ne
       ['platform', id]
     );
 
+    const emailed = await tryEmailTempPassword(
+      targetAdmin.email, targetAdmin.full_name, targetAdmin.username, tempPassword, 'reset'
+    );
+
     res.json({
       ok: true,
       data: {
         temp_password: tempPassword,
-        message: 'Password reset. Share the temp password. It will not be shown again.',
+        emailed,
+        message: emailed
+          ? `Password reset. The new temporary password was emailed to ${targetAdmin.email}.`
+          : 'Password reset. Share the temp password. It will not be shown again.',
       },
     });
   } catch (err) {

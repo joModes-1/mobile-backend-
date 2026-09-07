@@ -35,6 +35,7 @@ import tokenRouter from '@/modules/tokens/tokenRoutes';
 import washRouter from '@/modules/washes/washRoutes';
 import clientWashRouter from '@/modules/washes/clientWashRoutes';
 import reportRouter from '@/modules/reports/reportRoutes';
+import issueRouter from '@/modules/support/issueRoutes';
 import exceptionRouter from '@/modules/washes/exceptionRoutes';
 
 export const logger = pino({
@@ -128,6 +129,11 @@ app.post('/api/v1/clients/:id/loyalty/adjust', authenticate, requirePasswordChan
 
 // Phase 6: Reports
 app.use('/api/v1/reports', authenticate, requirePasswordChanged, reportRouter);
+
+// Support: deliberately WITHOUT requirePasswordChanged. Someone stuck behind
+// a broken forced-password-change is exactly the person who needs to report
+// it, and gating support on completing that flow would trap them.
+app.use('/api/v1/issues', issueRouter);
 
 // Client lookup (worker use) — must be after auth middleware
 app.get('/api/v1/clients/lookup', authenticate, requirePasswordChanged, requireRole('orgadmin', 'manager', 'worker'), async (req: Request, res: Response, next: NextFunction) => {

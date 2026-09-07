@@ -13,10 +13,21 @@ const envSchema = z.object({
   PORT: z.coerce.number().default(3000),
   SMTP_HOST: z.string().optional(),
   SMTP_PORT: z.coerce.number().default(587),
-  SMTP_SECURE: z.coerce.boolean().default(false),
+  // NOT z.coerce.boolean(): that applies JS truthiness, under which the
+  // string "false" is true — so SMTP_SECURE=false switched TLS ON and the
+  // handshake failed against plaintext port 587 with "wrong version number".
+  // Parse the text as text.
+  SMTP_SECURE: z
+    .enum(['true', 'false', '1', '0', ''])
+    .default('false')
+    .transform((v) => v === 'true' || v === '1'),
   SMTP_USER: z.string().optional(),
   SMTP_PASS: z.string().optional(),
   EMAIL_FROM: z.string().default('Car Wash Loyalty <no-reply@carwash.local>'),
+  // Where in-app issue reports are emailed. Optional: with no value the
+  // report is still saved and visible in the app, it just is not emailed —
+  // support must not break because SMTP has not been set up yet.
+  SUPPORT_EMAIL: z.string().optional(),
 });
 
 export type Env = z.infer<typeof envSchema>;

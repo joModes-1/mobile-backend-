@@ -72,7 +72,13 @@ router.get('/', requireRole('orgadmin', 'manager'), async (req: Request, res: Re
     let query = `
       SELECT b.id, b.name, b.code, b.address, b.phone, b.latitude, b.longitude,
              b.ready_alert_minutes, b.status, b.created_at,
-             (SELECT COUNT(*) FROM staff_users WHERE branch_id = b.id) as staff_count
+             -- Active only. Counting suspended staff told an org admin a
+             -- branch had more people working it than actually could —
+             -- a suspended account cannot open a shift or wash a car.
+             (SELECT COUNT(*) FROM staff_users
+               WHERE branch_id = b.id AND status = 'active') as staff_count,
+             (SELECT COUNT(*) FROM staff_users
+               WHERE branch_id = b.id AND status <> 'active') as suspended_staff_count
       FROM branches b
       WHERE b.org_id = $1
     `;
@@ -105,7 +111,11 @@ router.get('/:id', requireRole('orgadmin', 'manager'), async (req: Request, res:
     const result = await pool.query(
       `SELECT b.id, b.name, b.code, b.address, b.phone, b.latitude, b.longitude,
               b.ready_alert_minutes, b.status, b.created_at,
-              (SELECT COUNT(*) FROM staff_users WHERE branch_id = b.id) as staff_count
+              -- Active only, same reasoning as the list query above.
+              (SELECT COUNT(*) FROM staff_users
+                WHERE branch_id = b.id AND status = 'active') as staff_count,
+              (SELECT COUNT(*) FROM staff_users
+                WHERE branch_id = b.id AND status <> 'active') as suspended_staff_count
        FROM branches b
        WHERE b.id = $1 AND b.org_id = $2`,
       [id, orgId]

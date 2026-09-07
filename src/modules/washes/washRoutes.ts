@@ -98,11 +98,24 @@ router.post('/', requireRole('orgadmin', 'manager', 'worker'), async (req: Reque
     }
 
     // 3. Resolve service (default if omitted)
+    //
+    // Catalogue is branch-scoped: a type is either org-wide (branch_id NULL)
+    // or private to one branch. Every lookup below therefore has to accept
+    // both, and reject another branch's private type — otherwise a worker
+    // could start a wash against a car type their branch does not offer, and
+    // one with no price at their branch at that.
     let serviceId = req.body.service_id;
     if (!serviceId) {
+      // A branch's own default wins over the org-wide one: if this branch
+      // has defined its own services, the org default may not even be on
+      // offer here. ORDER BY puts the branch-specific row first.
       const svcResult = await client.query(
-        `SELECT id FROM services WHERE org_id = $1 AND is_default AND active`,
-        [orgId]
+        `SELECT id FROM services
+         WHERE org_id = $1 AND is_default AND active
+           AND (branch_id IS NULL OR branch_id = $2)
+         ORDER BY branch_id NULLS LAST
+         LIMIT 1`,
+        [orgId, branchId]
       );
       if (svcResult.rows.length === 0) {
         await client.query('ROLLBACK');
@@ -114,24 +127,28 @@ router.post('/', requireRole('orgadmin', 'manager', 'worker'), async (req: Reque
 
     // Validate service
     const svcCheck = await client.query(
-      `SELECT id, name, earns_point FROM services WHERE id = $1 AND org_id = $2 AND active`,
-      [serviceId, orgId]
+      `SELECT id, name, earns_point FROM services
+       WHERE id = $1 AND org_id = $2 AND active
+         AND (branch_id IS NULL OR branch_id = $3)`,
+      [serviceId, orgId, branchId]
     );
     if (svcCheck.rows.length === 0) {
       await client.query('ROLLBACK');
-      next(createAppError(404, 'SERVICE_NOT_FOUND', 'Service not found or inactive'));
+      next(createAppError(404, 'SERVICE_NOT_FOUND', 'Service not found or not offered at this branch'));
       return;
     }
     const service = svcCheck.rows[0];
 
     // Validate vehicle class
     const vcCheck = await client.query(
-      `SELECT id, name FROM vehicle_classes WHERE id = $1 AND org_id = $2 AND active`,
-      [req.body.vehicle_class_id, orgId]
+      `SELECT id, name FROM vehicle_classes
+       WHERE id = $1 AND org_id = $2 AND active
+         AND (branch_id IS NULL OR branch_id = $3)`,
+      [req.body.vehicle_class_id, orgId, branchId]
     );
     if (vcCheck.rows.length === 0) {
       await client.query('ROLLBACK');
-      next(createAppError(404, 'VEHICLE_CLASS_NOT_FOUND', 'Vehicle class not found or inactive'));
+      next(createAppError(404, 'VEHICLE_CLASS_NOT_FOUND', 'Car type not found or not offered at this branch'));
       return;
     }
     const vehicleClass = vcCheck.rows[0];
@@ -425,21 +442,36 @@ router.post('/settle-by-token', requireRole('orgadmin', 'manager', 'worker'), as
       return;
     }
 
-    // Consume pay token
+    // Look the token up WITHOUT consuming it yet.
+    //
+    // It used to be consumed here, before settleWash ran. That transaction
+    // can legitimately roll back — most often with HANDOVER_CONFIRM_REQUIRED,
+    // when a different worker started the car — but the consume had already
+    // committed outside it. The customer's QR was burnt by a settle that
+    // never happened, so the retry (this time with a handover reason) failed
+    // with "already used" and the customer had to generate a fresh code.
     const tokenHash = hashToken(body.pay_token);
-    const consumed = await consumeToken(pool, tokenHash, 'pay', workerId);
-    if (!consumed) {
+    const found = await pool.query(
+      `SELECT client_id, wash_id FROM client_tokens
+       WHERE token_hash = $1 AND purpose = 'pay'
+         AND consumed_at IS NULL AND expires_at > now()`,
+      [tokenHash]
+    );
+    if (found.rows.length === 0) {
       next(createAppError(409, 'BAD_TOKEN', 'Invalid, expired, or already used pay token'));
       return;
     }
+    const pending = found.rows[0];
 
-    // Route to settle logic
-    await settleWash(pool, consumed.wash_id!, {
+    // settleWash marks it consumed inside its own transaction, so the token
+    // survives a rollback and dies only with a settle that actually happened.
+    await settleWash(pool, pending.wash_id!, {
       workerId,
       branchId,
       orgId,
       payTokenConsumed: true,
-      clientId: consumed.client_id,
+      consumeTokenHash: tokenHash,
+      clientId: pending.client_id,
       handoverReason: body.handover_reason,
       handoverNote: body.handover_note,
     }, res, next);
@@ -513,6 +545,11 @@ interface SettleOpts {
   branchId: string;
   orgId: string;
   payTokenConsumed: boolean;
+  /**
+   * Pay token to mark consumed as part of this settle's transaction, so a
+   * rollback leaves the customer's code still usable for the retry.
+   */
+  consumeTokenHash?: string;
   clientId: string | null;
   unverifiedReason?: string;
   handoverReason?: string;
@@ -580,6 +617,10 @@ async function settleWash(
       next(createAppError(409, 'HANDOVER_CONFIRM_REQUIRED', 'Different worker started this wash. Provide handover_reason.', {
         starter_name: starterResult.rows[0]?.full_name,
         job_no: wash.job_no,
+        // The scanning worker cannot see this job in their own list, so the
+        // client has nothing to look the details up from — send enough to
+        // put a name and job number in front of them.
+        wash_id: washId,
       }));
       return;
     }
@@ -650,6 +691,23 @@ async function settleWash(
         amountUgx,
         opts.workerId
       );
+    }
+
+    // Burn the customer's pay token as part of this transaction — see the
+    // note in /settle-by-token. Guarded on consumed_at so two workers racing
+    // the same code cannot both settle: the second update matches no row.
+    if (opts.consumeTokenHash) {
+      const burn = await client.query(
+        `UPDATE client_tokens SET consumed_at = now(), consumed_by = $1
+         WHERE token_hash = $2 AND purpose = 'pay'
+           AND consumed_at IS NULL AND expires_at > now()`,
+        [opts.workerId, opts.consumeTokenHash]
+      );
+      if (burn.rowCount === 0) {
+        await client.query('ROLLBACK');
+        next(createAppError(409, 'BAD_TOKEN', 'Invalid, expired, or already used pay token'));
+        return;
+      }
     }
 
     await client.query('COMMIT');

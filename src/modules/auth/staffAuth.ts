@@ -180,15 +180,48 @@ router.post('/change-password', authenticate, async (req: Request, res: Response
       [newHash, req.actor.sub]
     );
 
-    // Revoke all refresh tokens for this user
+    // Revoke every existing refresh token: a password change should end any
+    // session opened with the old password, on any device.
     await pool.query(
       'UPDATE refresh_tokens SET revoked_at = now() WHERE owner_type = $1 AND owner_id = $2 AND revoked_at IS NULL',
       ['staff', req.actor.sub]
     );
 
+    // ...but not the session doing the changing. Revoking that one too meant
+    // the very next token refresh failed and the app bounced the user back to
+    // the login screen to re-enter the password they had just set. Issuing a
+    // fresh pair here keeps them signed in while still invalidating the old
+    // credentials everywhere else.
+    const staffRow = await pool.query(
+      'SELECT id, role, org_id, branch_id FROM staff_users WHERE id = $1',
+      [req.actor.sub]
+    );
+    const me = staffRow.rows[0];
+    const tokenPayload = {
+      sub: me.id,
+      type: 'staff' as const,
+      role: me.role,
+      org_id: me.org_id,
+      branch_id: me.branch_id,
+    };
+    const accessToken = signAccessToken(tokenPayload);
+    const refreshToken = signRefreshToken(tokenPayload);
+
+    const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
+    const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+    await pool.query(
+      'INSERT INTO refresh_tokens (owner_type, owner_id, token_hash, expires_at) VALUES ($1, $2, $3, $4)',
+      ['staff', me.id, tokenHash, expiresAt]
+    );
+
     res.json({
       ok: true,
-      data: { message: 'Password changed successfully' },
+      data: {
+        message: 'Password changed successfully',
+        access_token: accessToken,
+        refresh_token: refreshToken,
+        must_change_password: false,
+      },
     });
   } catch (err) {
     next(err);

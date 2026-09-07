@@ -829,16 +829,96 @@ router.get('/platform/stats', async (req: Request, res: Response, next: NextFunc
     }
   try {
     const pool = getPool();
-    const result = await pool.query(`
+    const summary = await pool.query(`
       SELECT
         (SELECT COUNT(*) FROM organizations) AS total_orgs,
         (SELECT COUNT(*) FROM organizations WHERE status = 'active') AS active_orgs,
+        (SELECT COUNT(*) FROM organizations WHERE status = 'suspended') AS suspended_orgs,
         (SELECT COUNT(*) FROM branches WHERE status = 'active') AS active_branches,
+        (SELECT COUNT(*) FROM staff_users WHERE status = 'active') AS active_staff,
+        (SELECT COUNT(*) FROM clients) AS total_clients,
+
+        -- Today vs this month: a platform admin wants to know it is alive
+        -- right now, not only that it did something three weeks ago.
+        (SELECT COUNT(*) FROM washes
+           WHERE status = 'settled' AND started_at::date = (now() AT TIME ZONE 'UTC')::date) AS washes_today,
+        (SELECT COALESCE(SUM(amount_ugx), 0) FROM washes
+           WHERE status = 'settled' AND started_at::date = (now() AT TIME ZONE 'UTC')::date) AS gross_today,
         (SELECT COUNT(*) FROM washes WHERE status = 'settled' AND started_at >= date_trunc('month', now())) AS washes_this_month,
-        (SELECT COALESCE(SUM(amount_ugx), 0) FROM washes WHERE status = 'settled' AND started_at >= date_trunc('month', now())) AS gross_this_month
+        (SELECT COALESCE(SUM(amount_ugx), 0) FROM washes WHERE status = 'settled' AND started_at >= date_trunc('month', now())) AS gross_this_month,
+        (SELECT COALESCE(SUM(amount_ugx), 0) FROM washes
+           WHERE status = 'settled'
+             AND started_at >= date_trunc('month', now()) - interval '1 month'
+             AND started_at < date_trunc('month', now())) AS gross_last_month,
+
+        -- Anything needing a human: unsettled cars, and cash sitting in
+        -- someone's pocket across the whole platform.
+        (SELECT COUNT(*) FROM washes WHERE status IN ('in_progress', 'ready')) AS open_jobs,
+        (SELECT COUNT(*) FROM washes
+           WHERE status = 'disputed') AS disputed_jobs,
+        (SELECT COALESCE(SUM(w.amount_ugx), 0)
+           FROM shifts s JOIN washes w ON w.settled_shift_id = s.id AND w.status = 'settled'
+           WHERE s.status <> 'closed') AS cash_with_workers,
+        (SELECT COUNT(*) FROM issue_reports WHERE status IN ('open', 'in_progress')) AS open_issues
     `);
 
-    res.json({ ok: true, data: result.rows[0] });
+    // Platform-wide daily trend. Same shape the org dashboard's chart uses,
+    // so the component is shared rather than a second one written.
+    const trend = await pool.query(`
+      WITH span AS (
+        SELECT generate_series(
+          (now() AT TIME ZONE 'UTC')::date - 13,
+          (now() AT TIME ZONE 'UTC')::date,
+          '1 day'::interval
+        )::date AS day
+      )
+      SELECT span.day::text AS day,
+        COUNT(w.id) FILTER (WHERE w.status = 'settled') AS washes,
+        COALESCE(SUM(w.amount_ugx) FILTER (WHERE w.status = 'settled'), 0) AS gross_ugx
+      FROM span
+      LEFT JOIN washes w ON w.started_at::date = span.day
+      GROUP BY span.day
+      ORDER BY span.day
+    `);
+
+    // Which tenants are actually carrying the platform.
+    const topOrgs = await pool.query(`
+      SELECT o.id, o.name, o.status,
+        COUNT(w.id) FILTER (WHERE w.status = 'settled') AS washes,
+        COALESCE(SUM(w.amount_ugx) FILTER (WHERE w.status = 'settled'), 0) AS gross_ugx,
+        (SELECT COUNT(*) FROM branches b WHERE b.org_id = o.id) AS branch_count
+      FROM organizations o
+      LEFT JOIN washes w
+        ON w.org_id = o.id AND w.started_at >= date_trunc('month', now())
+      GROUP BY o.id, o.name, o.status
+      ORDER BY gross_ugx DESC, o.name
+      LIMIT 8
+    `);
+
+    // A tenant that has stopped using the software is the earliest churn
+    // signal there is, and it never shows up in a revenue total.
+    const quiet = await pool.query(`
+      SELECT o.id, o.name,
+        (SELECT MAX(w.started_at) FROM washes w WHERE w.org_id = o.id) AS last_activity_at
+      FROM organizations o
+      WHERE o.status = 'active'
+        AND NOT EXISTS (
+          SELECT 1 FROM washes w
+          WHERE w.org_id = o.id AND w.started_at >= now() - interval '7 days'
+        )
+      ORDER BY last_activity_at DESC NULLS LAST
+      LIMIT 10
+    `);
+
+    res.json({
+      ok: true,
+      data: {
+        ...summary.rows[0],
+        trend: trend.rows,
+        top_orgs: topOrgs.rows,
+        quiet_orgs: quiet.rows,
+      },
+    });
   } catch (err) { next(err); }
 });
 

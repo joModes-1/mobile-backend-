@@ -104,8 +104,18 @@ router.post('/', requireRole('orgadmin', 'manager'), async (req: Request, res: R
       [orgId, req.actor!.sub, result.rows[0].id, JSON.stringify({ role: data.role, username: data.username })]
     );
 
+    // Best-effort: the staff row is already committed, so a mail failure must
+    // not turn a created account into a 500. It previously threw straight out
+    // of the handler — the worker existed but the caller saw an error and no
+    // password. `emailed` also assumed success from merely having an address.
+    let emailed = false;
     if (data.email) {
-      await sendStaffTempPasswordEmail(data.email, data.full_name, data.username, tempPassword, 'created');
+      try {
+        await sendStaffTempPasswordEmail(data.email, data.full_name, data.username, tempPassword, 'created');
+        emailed = true;
+      } catch (mailErr) {
+        console.error(`[email] temp password to ${data.email} failed:`, mailErr);
+      }
     }
 
     res.status(201).json({
@@ -113,8 +123,8 @@ router.post('/', requireRole('orgadmin', 'manager'), async (req: Request, res: R
       data: {
         staff_id: result.rows[0].id,
         temp_password: tempPassword,
-        emailed: !!data.email,
-        message: data.email
+        emailed,
+        message: emailed
           ? 'Staff member created. The temp password has also been emailed to them.'
           : 'Staff member created. No email on file — share the temp password directly. It will not be shown again.',
       },
@@ -324,18 +334,27 @@ router.post('/:id/reset-password', requireRole('orgadmin', 'manager'), async (re
       [orgId, req.actor!.sub, id, JSON.stringify({ target_role: target.role })]
     );
 
+    // Same reasoning as staff creation: the password has already been changed
+    // by this point. Throwing here would return a 500 while leaving the user
+    // locked out of an account whose new password nobody was ever shown.
+    let emailed = false;
     if (target.email) {
-      await sendStaffTempPasswordEmail(target.email, target.full_name, target.username, tempPassword, 'reset');
+      try {
+        await sendStaffTempPasswordEmail(target.email, target.full_name, target.username, tempPassword, 'reset');
+        emailed = true;
+      } catch (mailErr) {
+        console.error(`[email] reset password to ${target.email} failed:`, mailErr);
+      }
     }
 
     res.json({
       ok: true,
       data: {
         temp_password: tempPassword,
-        emailed: !!target.email,
-        message: target.email
+        emailed,
+        message: emailed
           ? 'Password reset. The temp password has also been emailed to them.'
-          : 'Password reset. No email on file — share the temp password directly. It will not be shown again.',
+          : 'Password reset. Share the temp password directly. It will not be shown again.',
       },
     });
   } catch (err) {

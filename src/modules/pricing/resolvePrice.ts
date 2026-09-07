@@ -21,11 +21,17 @@ export async function resolvePrice(
 ): Promise<PriceResult | null> {
   const pool = getPool();
 
+  // The type must be active AND on offer at this branch — org-wide
+  // (branch_id IS NULL) or private to this one. A branch's private type
+  // resolving a price for a different branch would price a wash against
+  // something that branch does not sell.
   const checkResult = await pool.query(
     `SELECT
-       (SELECT active FROM services WHERE id = $1 AND org_id = $3) AS service_active,
-       (SELECT active FROM vehicle_classes WHERE id = $2 AND org_id = $3) AS vc_active`,
-    [serviceId, vehicleClassId, orgId]
+       (SELECT active FROM services
+         WHERE id = $1 AND org_id = $3 AND (branch_id IS NULL OR branch_id = $4)) AS service_active,
+       (SELECT active FROM vehicle_classes
+         WHERE id = $2 AND org_id = $3 AND (branch_id IS NULL OR branch_id = $4)) AS vc_active`,
+    [serviceId, vehicleClassId, orgId, branchId]
   );
 
   const row = checkResult.rows[0];

@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { getPool } from '@/db';
 import { createAppError } from '@/middleware/errorHandler';
 import { requireRole, getOrgId } from '@/middleware/requireRole';
+import { catalogueScope } from '@/modules/catalogue/scope';
 
 const router = Router();
 
@@ -29,16 +30,31 @@ router.get('/', requireRole('orgadmin', 'manager'), async (req: Request, res: Re
   try {
     const orgId = getOrgId(req.actor!);
     const pool = getPool();
-    const branchId = req.query.branch_id as string | undefined;
+    // A manager is pinned to their own branch regardless of the query string;
+    // an org admin sees the whole org unless they ask for one branch.
+    const branchId =
+      req.actor!.role === 'manager'
+        ? req.actor!.branch_id
+        : (req.query.branch_id as string | undefined);
 
-    // Get services and vehicle classes
+    // The catalogue is scoped too: a branch's private car/wash types belong
+    // in its own grid, and must not leak into another branch's.
+    const svcScope = catalogueScope(req.actor!, req.query.branch_id as string | undefined, 's', 2);
+    const vcScope = catalogueScope(req.actor!, req.query.branch_id as string | undefined, 'vc', 2);
+
     const services = await pool.query(
-      'SELECT id, name, is_default FROM services WHERE org_id = $1 AND active ORDER BY name',
-      [orgId]
+      `SELECT s.id, s.name, s.is_default, s.branch_id
+       FROM services s
+       WHERE s.org_id = $1 AND s.active${svcScope.sql}
+       ORDER BY s.name`,
+      [orgId, ...svcScope.params]
     );
     const vehicleClasses = await pool.query(
-      'SELECT id, name, sort_order FROM vehicle_classes WHERE org_id = $1 AND active ORDER BY sort_order, name',
-      [orgId]
+      `SELECT vc.id, vc.name, vc.sort_order, vc.branch_id
+       FROM vehicle_classes vc
+       WHERE vc.org_id = $1 AND vc.active${vcScope.sql}
+       ORDER BY vc.sort_order, vc.name`,
+      [orgId, ...vcScope.params]
     );
 
     // Get all active prices for this org
@@ -133,19 +149,23 @@ router.get('/effective', requireRole('orgadmin', 'manager', 'worker'), async (re
       return;
     }
 
-    // Get vehicle classes
-    let vcQuery = 'SELECT id, name, sort_order FROM vehicle_classes WHERE org_id = $1 AND active ORDER BY sort_order, name';
-    const vcParams: any[] = [orgId];
+    // Only what this branch actually offers: org-wide types plus its own.
+    // A worker must never be shown another branch's private car/wash type.
+    const vcParams: any[] = [orgId, branchId];
+    let vcQuery = `SELECT id, name, sort_order FROM vehicle_classes
+       WHERE org_id = $1 AND active AND (branch_id IS NULL OR branch_id = $2)`;
     if (vehicleClassId) {
-      vcQuery += ' AND id = $2';
       vcParams.push(vehicleClassId);
+      vcQuery += ` AND id = $${vcParams.length}`;
     }
+    vcQuery += ' ORDER BY sort_order, name';
     const vehicleClasses = await pool.query(vcQuery, vcParams);
 
-    // Get active services
     const services = await pool.query(
-      'SELECT id, name FROM services WHERE org_id = $1 AND active ORDER BY name',
-      [orgId]
+      `SELECT id, name FROM services
+       WHERE org_id = $1 AND active AND (branch_id IS NULL OR branch_id = $2)
+       ORDER BY name`,
+      [orgId, branchId]
     );
 
     // Get all prices for this org
@@ -187,7 +207,7 @@ router.get('/effective', requireRole('orgadmin', 'manager', 'worker'), async (re
 
 // --- PUT /prices — upsert org-wide price ---
 
-router.put('/', requireRole('orgadmin'), async (req: Request, res: Response, next: NextFunction) => {
+router.put('/', requireRole('orgadmin', 'manager'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const data = upsertPriceSchema.parse(req.body);
     const orgId = getOrgId(req.actor!);
@@ -196,6 +216,32 @@ router.put('/', requireRole('orgadmin'), async (req: Request, res: Response, nex
     if (data.branch_id) {
       next(createAppError(400, 'INVALID', 'Use PUT /prices/branch/:branch_id for branch prices'));
       return;
+    }
+
+    // A manager may write an org-scope price ONLY for a type that belongs to
+    // their own branch. Such a type is invisible to every other branch, so
+    // its price is effectively branch-local anyway — and a branch override on
+    // a type only one branch can see would be pointless indirection. For a
+    // genuinely shared org-wide type they must use the branch-override route,
+    // which is what keeps one branch from repricing the whole org.
+    if (req.actor!.role === 'manager') {
+      const scopeCheck = await pool.query(
+        `SELECT
+           (SELECT branch_id FROM services WHERE id = $1 AND org_id = $3) AS service_branch,
+           (SELECT branch_id FROM vehicle_classes WHERE id = $2 AND org_id = $3) AS vc_branch`,
+        [data.service_id, data.vehicle_class_id, orgId]
+      );
+      const { service_branch, vc_branch } = scopeCheck.rows[0] || {};
+      const mine = req.actor!.branch_id;
+      const ownsBoth = service_branch === mine && vc_branch === mine;
+      if (!ownsBoth) {
+        next(createAppError(
+          403,
+          'SHARED_CATALOGUE_ITEM',
+          'This car type or wash type is shared across branches — set a price for your branch instead'
+        ));
+        return;
+      }
     }
 
     // Check for existing org-wide price
@@ -342,11 +388,42 @@ router.delete('/branch/:branch_id/:price_id', requireRole('orgadmin', 'manager')
 
 // --- POST /prices/bulk — batch upsert in one transaction ---
 
-router.post('/bulk', requireRole('orgadmin'), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/bulk', requireRole('orgadmin', 'manager'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const data = bulkPriceSchema.parse(req.body);
     const orgId = getOrgId(req.actor!);
     const pool = getPool();
+
+    // Same rule as PUT /prices, applied to every row up front: a manager can
+    // bulk-price only their own branch's types. Checked before the
+    // transaction opens so a rejected batch writes nothing at all.
+    if (req.actor!.role === 'manager') {
+      const mine = req.actor!.branch_id;
+      if (data.prices.some((p) => p.branch_id && p.branch_id !== mine)) {
+        next(createAppError(403, 'FORBIDDEN', 'Managers can only price their own branch'));
+        return;
+      }
+      const serviceIds = [...new Set(data.prices.map((p) => p.service_id))];
+      const vcIds = [...new Set(data.prices.map((p) => p.vehicle_class_id))];
+      const owned = await pool.query(
+        `SELECT
+           (SELECT COUNT(*) FROM services
+             WHERE org_id = $1 AND id = ANY($2::uuid[]) AND branch_id IS NOT DISTINCT FROM $4) AS svc_ok,
+           (SELECT COUNT(*) FROM vehicle_classes
+             WHERE org_id = $1 AND id = ANY($3::uuid[]) AND branch_id IS NOT DISTINCT FROM $4) AS vc_ok`,
+        [orgId, serviceIds, vcIds, mine]
+      );
+      const { svc_ok, vc_ok } = owned.rows[0];
+      if (Number(svc_ok) !== serviceIds.length || Number(vc_ok) !== vcIds.length) {
+        next(createAppError(
+          403,
+          'SHARED_CATALOGUE_ITEM',
+          'Some of these are shared across branches — set prices for your branch individually instead'
+        ));
+        return;
+      }
+    }
+
     const client = await pool.connect();
 
     try {
@@ -457,17 +534,21 @@ router.post('/resolve', requireRole('orgadmin', 'manager', 'worker'), async (req
     const orgId = getOrgId(req.actor!);
     const pool = getPool();
 
-    // Verify both service and vehicle class are active
+    // Verify both are active and actually offered at this branch. (The org_id
+    // placeholder was written as $4 while only three params were passed —
+    // harmless only because $3 went unreferenced; both are bound properly now.)
     const checkResult = await pool.query(
       `SELECT
-         (SELECT active FROM services WHERE id = $1 AND org_id = $4) AS service_active,
-         (SELECT active FROM vehicle_classes WHERE id = $2 AND org_id = $4) AS vc_active`,
-      [service_id, vehicle_class_id, orgId]
+         (SELECT active FROM services
+           WHERE id = $1 AND org_id = $3 AND (branch_id IS NULL OR branch_id = $4)) AS service_active,
+         (SELECT active FROM vehicle_classes
+           WHERE id = $2 AND org_id = $3 AND (branch_id IS NULL OR branch_id = $4)) AS vc_active`,
+      [service_id, vehicle_class_id, orgId, branch_id]
     );
 
     const checkRow = checkResult.rows[0];
     if (!checkRow.service_active || !checkRow.vc_active) {
-      next(createAppError(422, 'INACTIVE_ITEM', 'Service or vehicle class is inactive'));
+      next(createAppError(422, 'INACTIVE_ITEM', 'Service or car type is inactive or not offered at this branch'));
       return;
     }
 
