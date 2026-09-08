@@ -3,6 +3,7 @@ import argon2 from 'argon2';
 import { z } from 'zod';
 import { getPool } from '@/db';
 import { signAccessToken, signRefreshToken } from '@/utils/jwt';
+import { authenticate } from '@/middleware/auth';
 import { createAppError } from '@/middleware/errorHandler';
 import { sendVerificationCodeEmail, sendPasswordResetCodeEmail } from '@/utils/email';
 import crypto from 'crypto';
@@ -70,6 +71,11 @@ const requestPasswordResetSchema = z.object({
 const resetPasswordSchema = z.object({
   email: z.string().email(),
   code: z.string().length(6),
+  new_password: z.string().min(6),
+});
+
+const changePasswordSchema = z.object({
+  current_password: z.string().min(1),
   new_password: z.string().min(6),
 });
 
@@ -398,6 +404,88 @@ router.post('/reset-password', async (req: Request, res: Response, next: NextFun
     res.json({
       ok: true,
       data: { message: 'Password reset successfully' },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /auth/client/change-password
+ *
+ * The in-app "know my current password, want a new one" flow — distinct
+ * from reset-password, which is the emailed-OTP path for someone who is
+ * locked out. Clients set their own password at registration and have no
+ * must_change_password flag, so this is an ordinary account-settings
+ * action, not a forced first-login step.
+ */
+router.post('/change-password', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    if (!req.actor || req.actor.type !== 'client') {
+      next(createAppError(403, 'FORBIDDEN', 'Client access required'));
+      return;
+    }
+
+    const { current_password, new_password } = changePasswordSchema.parse(req.body);
+    const pool = getPool();
+
+    const result = await pool.query(
+      'SELECT password_hash, org_id FROM clients WHERE id = $1',
+      [req.actor.sub]
+    );
+
+    if (result.rows.length === 0) {
+      next(createAppError(404, 'NOT_FOUND', 'Client not found'));
+      return;
+    }
+
+    const client = result.rows[0];
+
+    if (!client.password_hash) {
+      next(createAppError(401, 'NO_PASSWORD', 'Account has no password set. Use "Forgot password" instead.'));
+      return;
+    }
+
+    const valid = await argon2.verify(client.password_hash, current_password);
+    if (!valid) {
+      next(createAppError(401, 'INVALID_CREDENTIALS', 'Current password is incorrect'));
+      return;
+    }
+
+    const newHash = await argon2.hash(new_password);
+    await pool.query(
+      'UPDATE clients SET password_hash = $1, updated_at = now() WHERE id = $2',
+      [newHash, req.actor.sub]
+    );
+
+    // Same reasoning as the staff route: revoke every other session on this
+    // account, but issue this session a fresh pair rather than revoking it
+    // too — otherwise the very next refresh fails and the app has nothing to
+    // do but drop the client back to the login screen right after they set
+    // their new password.
+    await pool.query(
+      'UPDATE refresh_tokens SET revoked_at = now() WHERE owner_type = $1 AND owner_id = $2 AND revoked_at IS NULL',
+      ['client', req.actor.sub]
+    );
+
+    const tokenPayload = { sub: req.actor.sub, type: 'client' as const, org_id: client.org_id };
+    const accessToken = signAccessToken(tokenPayload);
+    const refreshToken = signRefreshToken(tokenPayload);
+
+    const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
+    const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+    await pool.query(
+      'INSERT INTO refresh_tokens (owner_type, owner_id, token_hash, expires_at) VALUES ($1, $2, $3, $4)',
+      ['client', req.actor.sub, tokenHash, expiresAt]
+    );
+
+    res.json({
+      ok: true,
+      data: {
+        message: 'Password changed successfully',
+        access_token: accessToken,
+        refresh_token: refreshToken,
+      },
     });
   } catch (err) {
     next(err);
