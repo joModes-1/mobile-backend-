@@ -54,17 +54,60 @@ export async function seed(knex: Knex): Promise<void> {
   const grace = await staffBy('grace');
   const orgadmin = await staffBy('orgadmin');
 
-  // ── A worker at Kabalagala, so the org admin has two live branches ──
-  let sarah = await staffBy('sarah');
-  if (!sarah) {
-    const r = await one(
+  // ── A full crew at each bay ───────────────────────────────────────
+  // A leaderboard needs a field to rank. With two workers it is not a
+  // ranking, it is a pair — so each branch gets a realistic crew and the
+  // board has a genuine spread of top, middle and trailing performers.
+  const workerHash = await argon2.hash('Worker123!');
+
+  /** Adds a worker if that username is free; returns the row either way. */
+  const ensureWorker = async (username: string, fullName: string, branchId: string) => {
+    const found = await staffBy(username);
+    if (found) return found;
+    const row = await one(
       `INSERT INTO staff_users (org_id, branch_id, role, full_name, username, email, password_hash, must_change_password, created_by)
        VALUES (?, ?, 'worker', ?, ?, ?, ?, true, ?) RETURNING id, full_name, branch_id`,
-      [orgId, kbl.id, 'Sarah A.', 'sarah', 'sarah@democarwash.com', await argon2.hash('Worker123!'), grace?.id ?? null]
+      [orgId, branchId, fullName, username, `${username}@democarwash.com`, workerHash, grace?.id ?? null]
     );
-    sarah = r;
-    console.log('  + worker: sarah / Worker123! (Kabalagala)');
-  }
+    console.log(`  + worker: ${username} / Worker123!`);
+    return row;
+  };
+
+  // joseph and musa already exist at Ntinda; sarah stays at Kabalagala so
+  // the history already seeded against her still lines up.
+  const ntdNames: Array<[string, string]> = [
+    ['daniel',   'Daniel O.'],
+    ['patrick',  'Patrick S.'],
+    ['brenda',   'Brenda K.'],
+    ['ronald',   'Ronald M.'],
+    ['justine',  'Justine A.'],
+    ['edwin',    'Edwin B.'],
+    ['claire',   'Claire N.'],
+    ['isaac',    'Isaac W.'],
+    ['martha',   'Martha L.'],
+    ['kevin',    'Kevin R.'],
+  ];
+  const kblNames: Array<[string, string]> = [
+    ['gloria',   'Gloria P.'],
+    ['simon',    'Simon T.'],
+    ['rachel',   'Rachel I.'],
+    ['peterk',   'Peter Kw.'],
+    ['agnes',    'Agnes F.'],
+    ['tonny',    'Tonny G.'],
+    ['sharon',   'Sharon V.'],
+    ['emma',     'Emma D.'],
+    ['julius',   'Julius H.'],
+    ['nancy',    'Nancy C.'],
+    ['fred',     'Fred Z.'],
+  ];
+
+  const sarah = await ensureWorker('sarah', 'Sarah A.', kbl.id);
+
+  const ntdWorkers = [joseph, musa].filter(Boolean);
+  for (const [u, n] of ntdNames) ntdWorkers.push(await ensureWorker(u, n, ntd.id));
+
+  const kblWorkers = [sarah].filter(Boolean);
+  for (const [u, n] of kblNames) kblWorkers.push(await ensureWorker(u, n, kbl.id));
 
   // ── Clients ───────────────────────────────────────────────────────
   const memberCode = () => {
@@ -157,8 +200,8 @@ export async function seed(knex: Knex): Promise<void> {
   today.setHours(0, 0, 0, 0);
 
   const crews: Array<{ branch: any; workers: any[] }> = [
-    { branch: ntd, workers: [joseph, musa].filter(Boolean) },
-    { branch: kbl, workers: [sarah].filter(Boolean) },
+    { branch: ntd, workers: ntdWorkers },
+    { branch: kbl, workers: kblWorkers },
   ];
 
   // ── Day loop: oldest first so loyalty accrues in the right order ──
@@ -172,9 +215,19 @@ export async function seed(knex: Knex): Promise<void> {
     for (const crew of crews) {
       if (!crew.branch || crew.workers.length === 0) continue;
 
-      for (const worker of crew.workers) {
+      for (let wi = 0; wi < crew.workers.length; wi++) {
+        const worker = crew.workers[wi];
+
+        // A crew is not uniform, and a leaderboard where everyone scores the
+        // same is not worth reading. Earlier names in the roster are the
+        // reliable full-timers; later ones are part-time or relief staff who
+        // show up less often, which produces a real ranking spread.
+        const rosterDepth = wi / Math.max(crew.workers.length - 1, 1);
+        const showsUp = 0.95 - rosterDepth * 0.6;   // ~95% down to ~35%
+        if (!chance(showsUp)) continue;
+
         // Kabalagala is the quieter branch.
-        if (crew.branch.id === kbl.id && chance(0.35)) continue;
+        if (crew.branch.id === kbl.id && chance(0.25)) continue;
 
         const openAt = new Date(day);
         openAt.setHours(8, Math.floor(rnd() * 30), 0, 0);
@@ -189,9 +242,14 @@ export async function seed(knex: Knex): Promise<void> {
         );
         shiftCount++;
 
-        const jobsToday = crew.branch.id === ntd.id
-          ? 3 + Math.floor(rnd() * 4)
-          : 2 + Math.floor(rnd() * 3);
+        // Faster hands at the top of the roster take more cars per shift, so
+        // the gap between first and last place comes from real throughput
+        // rather than only from who turned up.
+        const base = crew.branch.id === ntd.id ? 4 : 3;
+        const jobsToday = Math.max(
+          1,
+          base + Math.round((1 - rosterDepth) * 3) - Math.floor(rnd() * 2)
+        );
 
         let expectedCash = 0;
 
