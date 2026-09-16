@@ -1,133 +1,149 @@
 import { Knex } from 'knex';
 import argon2 from 'argon2';
 
+/**
+ * Idempotent seed: adds what is missing, never removes anything.
+ *
+ * This used to DELETE every table before inserting, which made it a
+ * reset-to-zero tool that could not be run twice — the second run wiped
+ * whatever real testing data had built up. Now each row is looked up by its
+ * natural key first and only inserted when absent, so running it against a
+ * populated database tops up the fixture and leaves everything else alone.
+ *
+ * Passwords are only set when an account is created. An existing user keeps
+ * the password they already have, so re-seeding never silently resets
+ * someone's credentials back to the default.
+ *
+ * Note on lookups: the unique indexes here are expression indexes
+ * (lower(slug), upper(code), lower(username)), which ON CONFLICT cannot
+ * target. Hence explicit select-then-insert rather than an upsert.
+ */
 export async function seed(knex: Knex): Promise<void> {
   // Reads real process env vars — Render (and every other host) injects
-  // config this way, not as a checked-in .env file. The previous version
-  // parsed ../../../.env directly off disk, which does not exist on a
-  // hosted deploy and would have silently fallen through to the hardcoded
-  // admin@carwash.com / admin123 defaults below instead of the credentials
-  // actually set in the hosting dashboard.
+  // config this way, not as a checked-in .env file.
   const env = process.env;
 
-  // This wipes every organization, staff user, wash and client in the
-  // database. It is meant to run exactly once, against an empty database,
-  // as a manual step — never as part of an automated deploy or migration
-  // step, and never again once real data exists.
-  if (env.NODE_ENV === 'production' && env.ALLOW_PROD_SEED !== 'true') {
-    throw new Error(
-      'Refusing to run the destructive seed in production. If this is genuinely a fresh ' +
-      'database with no real data yet, set ALLOW_PROD_SEED=true for this one run and unset it after.'
+  let created = 0;
+  let skipped = 0;
+  const note = (didCreate: boolean, label: string) => {
+    if (didCreate) { created++; console.log(`  + ${label}`); }
+    else { skipped++; }
+  };
+
+  /** Returns the id of an existing row matched by `where`, or inserts one. */
+  async function ensure(
+    table: string,
+    where: { sql: string; params: any[] },
+    insert: { columns: string; values: string; params: any[] },
+    label: string
+  ): Promise<string> {
+    const found = await knex.raw(
+      `SELECT id FROM ${table} WHERE ${where.sql} LIMIT 1`,
+      where.params
     );
+    if (found.rows.length > 0) { note(false, label); return found.rows[0].id; }
+
+    const inserted = await knex.raw(
+      `INSERT INTO ${table} (${insert.columns}) VALUES (${insert.values}) RETURNING id`,
+      insert.params
+    );
+    note(true, label);
+    return inserted.rows[0].id;
   }
 
-  // Clean existing data (order matters for foreign keys)
-  await knex.raw('DELETE FROM loyalty_ledger');
-  await knex.raw('DELETE FROM loyalty_accounts');
-  await knex.raw('DELETE FROM loyalty_configs');
-  await knex.raw('DELETE FROM client_tokens');
-  await knex.raw('DELETE FROM washes');
-  await knex.raw('DELETE FROM branch_counters');
-  await knex.raw('DELETE FROM shifts');
-  await knex.raw('DELETE FROM audit_logs');
-  await knex.raw('DELETE FROM devices');
-  await knex.raw('DELETE FROM otp_codes');
-  await knex.raw('DELETE FROM refresh_tokens');
-  await knex.raw('DELETE FROM prices');
-  await knex.raw('DELETE FROM services');
-  await knex.raw('DELETE FROM vehicle_classes');
-  await knex.raw('DELETE FROM clients');
-  await knex.raw('DELETE FROM staff_users CASCADE');
-  await knex.raw('DELETE FROM branches');
-  await knex.raw('DELETE FROM organizations');
-  await knex.raw('DELETE FROM platform_admins CASCADE');
-
+  // ── Platform admin ────────────────────────────────────────────────
   const sysadminEmail = env.SEED_SYSADMIN_EMAIL || 'admin@carwash.com';
   const sysadminUsername = env.SEED_SYSADMIN_USERNAME || 'sysadmin';
   const sysadminPassword = env.SEED_SYSADMIN_PASSWORD || 'admin123';
-  const sysadminHash = await argon2.hash(sysadminPassword);
 
-  // 1. Create sysadmin
-  const sysadminResult = await knex.raw(
-    `INSERT INTO platform_admins (full_name, username, email, password_hash, must_change_password)
-     VALUES (?, ?, ?, ?, true) RETURNING id`,
-    ['System Administrator', sysadminUsername, sysadminEmail, sysadminHash]
-  );
-  const sysadminId = sysadminResult.rows[0].id;
-  console.log(`  ✓ Created sysadmin: ${sysadminUsername} / ${sysadminPassword}`);
-
-  // 2. Create demo org
-  const orgResult = await knex.raw(
-    `INSERT INTO organizations (name, slug, phone, contact_name, created_by)
-     VALUES (?, ?, ?, ?, ?) RETURNING id`,
-    ['Demo Car Wash', 'demo', '+256700000000', 'Demo Owner', sysadminId]
-  );
-  const orgId = orgResult.rows[0].id;
-  console.log(`  ✓ Created org: Demo Car Wash`);
-
-  // 3. Create two branches
-  const branch1Result = await knex.raw(
-    `INSERT INTO branches (org_id, name, code, address, phone)
-     VALUES (?, ?, ?, ?, ?) RETURNING id`,
-    [orgId, 'Ntinda Bay', 'NTD', '123 Ntinda Road, Kampala', '+256700000001']
-  );
-  const branch1Id = branch1Result.rows[0].id;
-
-  const branch2Result = await knex.raw(
-    `INSERT INTO branches (org_id, name, code, address, phone)
-     VALUES (?, ?, ?, ?, ?) RETURNING id`,
-    [orgId, 'Kabalagala Bay', 'KBL', '456 Kabalagala Road, Kampala', '+256700000002']
-  );
-  const branch2Id = branch2Result.rows[0].id;
-  console.log(`  ✓ Created branches: Ntinda Bay (NTD), Kabalagala Bay (KBL)`);
-
-  // 4. Create orgadmin
-  const orgadminHash = await argon2.hash('Orgadmin123!');
-  const orgadminResult = await knex.raw(
-    `INSERT INTO staff_users (org_id, branch_id, role, full_name, username, email, password_hash, must_change_password, created_by)
-     VALUES (?, NULL, 'orgadmin', ?, ?, ?, ?, true, NULL) RETURNING id`,
-    [orgId, 'Org Admin', 'orgadmin', 'admin@democarwash.com', orgadminHash]
-  );
-  const orgadminId = orgadminResult.rows[0].id;
-  console.log(`  ✓ Created orgadmin: orgadmin / Orgadmin123!`);
-
-  // 5. Create manager (branch 1)
-  const managerHash = await argon2.hash('Manager123!');
-  const managerResult = await knex.raw(
-    `INSERT INTO staff_users (org_id, branch_id, role, full_name, username, email, password_hash, must_change_password, created_by)
-     VALUES (?, ?, 'manager', ?, ?, ?, ?, true, ?) RETURNING id`,
-    [orgId, branch1Id, 'Grace N.', 'grace', 'grace@democarwash.com', managerHash, orgadminId]
-  );
-  const managerId = managerResult.rows[0].id;
-  console.log(`  ✓ Created manager: grace / Manager123! (Ntinda Bay)`);
-
-  // 6. Create two workers (branch 1)
-  const worker1Hash = await argon2.hash('Worker123!');
-  await knex.raw(
-    `INSERT INTO staff_users (org_id, branch_id, role, full_name, username, email, password_hash, must_change_password, created_by)
-     VALUES (?, ?, 'worker', ?, ?, ?, ?, true, ?)`,
-    [orgId, branch1Id, 'Joseph K.', 'joseph', 'joseph@democarwash.com', worker1Hash, managerId]
+  const sysadminId = await ensure(
+    'platform_admins',
+    { sql: 'lower(username) = lower(?)', params: [sysadminUsername] },
+    {
+      columns: 'full_name, username, email, password_hash, must_change_password',
+      values: '?, ?, ?, ?, true',
+      params: ['System Administrator', sysadminUsername, sysadminEmail, await argon2.hash(sysadminPassword)],
+    },
+    `sysadmin: ${sysadminUsername} / ${sysadminPassword}`
   );
 
-  const worker2Hash = await argon2.hash('Worker123!');
-  await knex.raw(
-    `INSERT INTO staff_users (org_id, branch_id, role, full_name, username, email, password_hash, must_change_password, created_by)
-     VALUES (?, ?, 'worker', ?, ?, ?, ?, true, ?)`,
-    [orgId, branch1Id, 'Musa K.', 'musa', 'musa@democarwash.com', worker2Hash, managerId]
+  // ── Org A: Demo Car Wash ──────────────────────────────────────────
+  const orgId = await ensure(
+    'organizations',
+    { sql: 'lower(slug) = lower(?)', params: ['demo'] },
+    {
+      columns: 'name, slug, phone, contact_name, created_by',
+      values: '?, ?, ?, ?, ?',
+      params: ['Demo Car Wash', 'demo', '+256700000000', 'Demo Owner', sysadminId],
+    },
+    'org: Demo Car Wash'
   );
-  console.log(`  ✓ Created workers: joseph / Worker123!, musa / Worker123! (Ntinda Bay)`);
 
-  // 7. Create one client
-  const memberCode = 'MC-' + Math.random().toString(36).substring(2, 8).toUpperCase();
-  const clientPasswordHash = await argon2.hash('Client123!');
-  await knex.raw(
-    `INSERT INTO clients (org_id, full_name, phone, member_code, phone_verified, username, email, email_verified, password_hash)
-     VALUES (?, ?, ?, ?, true, ?, ?, true, ?)`,
-    [orgId, 'Peter O.', '+256700123456', memberCode, 'peter_o', 'peter.o@example.com', clientPasswordHash]
+  const branch1Id = await ensure(
+    'branches',
+    { sql: 'org_id = ? AND upper(code) = upper(?)', params: [orgId, 'NTD'] },
+    {
+      columns: 'org_id, name, code, address, phone',
+      values: '?, ?, ?, ?, ?',
+      params: [orgId, 'Ntinda Bay', 'NTD', '123 Ntinda Road, Kampala', '+256700000001'],
+    },
+    'branch: Ntinda Bay (NTD)'
   );
-  console.log(`  ✓ Created client: peter_o / Client123! (member code: ${memberCode})`);
 
-  // 8. Create vehicle classes
+  const branch2Id = await ensure(
+    'branches',
+    { sql: 'org_id = ? AND upper(code) = upper(?)', params: [orgId, 'KBL'] },
+    {
+      columns: 'org_id, name, code, address, phone',
+      values: '?, ?, ?, ?, ?',
+      params: [orgId, 'Kabalagala Bay', 'KBL', '456 Kabalagala Road, Kampala', '+256700000002'],
+    },
+    'branch: Kabalagala Bay (KBL)'
+  );
+
+  // ── Staff ─────────────────────────────────────────────────────────
+  /** Staff are unique per (org, username). Password only set on creation. */
+  async function ensureStaff(
+    username: string, fullName: string, role: string,
+    branchId: string | null, email: string, password: string, createdBy: string | null
+  ): Promise<string> {
+    return ensure(
+      'staff_users',
+      { sql: 'org_id = ? AND lower(username) = lower(?)', params: [orgId, username] },
+      {
+        columns: 'org_id, branch_id, role, full_name, username, email, password_hash, must_change_password, created_by',
+        values: '?, ?, ?, ?, ?, ?, ?, true, ?',
+        params: [orgId, branchId, role, fullName, username, email, await argon2.hash(password), createdBy],
+      },
+      `${role}: ${username} / ${password}`
+    );
+  }
+
+  const orgadminId = await ensureStaff('orgadmin', 'Org Admin', 'orgadmin', null, 'admin@democarwash.com', 'Orgadmin123!', null);
+  const managerId = await ensureStaff('grace', 'Grace N.', 'manager', branch1Id, 'grace@democarwash.com', 'Manager123!', orgadminId);
+  await ensureStaff('joseph', 'Joseph K.', 'worker', branch1Id, 'joseph@democarwash.com', 'Worker123!', managerId);
+  await ensureStaff('musa', 'Musa K.', 'worker', branch1Id, 'musa@democarwash.com', 'Worker123!', managerId);
+
+  // ── Client ────────────────────────────────────────────────────────
+  function memberCode(): string {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let code = 'MC-';
+    for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+    return code;
+  }
+
+  await ensure(
+    'clients',
+    { sql: 'org_id = ? AND lower(username) = lower(?)', params: [orgId, 'peter_o'] },
+    {
+      columns: 'org_id, full_name, phone, member_code, phone_verified, username, email, email_verified, password_hash',
+      values: '?, ?, ?, ?, true, ?, ?, true, ?',
+      params: [orgId, 'Peter O.', '+256700123456', memberCode(), 'peter_o', 'peter.o@example.com', await argon2.hash('Client123!')],
+    },
+    'client: peter_o / Client123!'
+  );
+
+  // ── Catalogue ─────────────────────────────────────────────────────
   const vehicleClasses = [
     { name: 'Saloon', sort_order: 1 },
     { name: 'SUV', sort_order: 2 },
@@ -137,15 +153,25 @@ export async function seed(knex: Knex): Promise<void> {
   ];
   const vcIds: Record<string, string> = {};
   for (const vc of vehicleClasses) {
-    const r = await knex.raw(
-      `INSERT INTO vehicle_classes (org_id, name, sort_order) VALUES (?, ?, ?) RETURNING id`,
-      [orgId, vc.name, vc.sort_order]
+    vcIds[vc.name] = await ensure(
+      'vehicle_classes',
+      { sql: 'org_id = ? AND lower(name) = lower(?) AND branch_id IS NULL', params: [orgId, vc.name] },
+      {
+        columns: 'org_id, name, sort_order',
+        values: '?, ?, ?',
+        params: [orgId, vc.name, vc.sort_order],
+      },
+      `vehicle class: ${vc.name}`
     );
-    vcIds[vc.name] = r.rows[0].id;
   }
-  console.log(`  ✓ Created ${vehicleClasses.length} vehicle classes`);
 
-  // 9. Create services
+  // Only one service per org may carry is_default (partial unique index), so
+  // a new default is only claimed when the org has none yet.
+  const existingDefault = await knex.raw(
+    `SELECT id FROM services WHERE org_id = ? AND is_default LIMIT 1`, [orgId]
+  );
+  const orgHasDefault = existingDefault.rows.length > 0;
+
   const services = [
     { name: 'Full wash', is_default: true, earns_point: true },
     { name: 'Half wash', is_default: false, earns_point: true },
@@ -154,94 +180,118 @@ export async function seed(knex: Knex): Promise<void> {
   ];
   const svcIds: Record<string, string> = {};
   for (const svc of services) {
-    const r = await knex.raw(
-      `INSERT INTO services (org_id, name, is_default, earns_point) VALUES (?, ?, ?, ?) RETURNING id`,
-      [orgId, svc.name, svc.is_default, svc.earns_point]
+    svcIds[svc.name] = await ensure(
+      'services',
+      { sql: 'org_id = ? AND lower(name) = lower(?) AND branch_id IS NULL', params: [orgId, svc.name] },
+      {
+        columns: 'org_id, name, is_default, earns_point',
+        values: '?, ?, ?, ?',
+        params: [orgId, svc.name, svc.is_default && !orgHasDefault, svc.earns_point],
+      },
+      `service: ${svc.name}`
     );
-    svcIds[svc.name] = r.rows[0].id;
   }
-  console.log(`  ✓ Created ${services.length} services`);
 
-  // 10. Create org-wide price matrix
+  // ── Prices ────────────────────────────────────────────────────────
   const priceMatrix: Record<string, Record<string, number>> = {
     'Full wash':     { Saloon: 20000, SUV: 30000, Pickup: 35000, Van: 25000, Truck: 35000 },
     'Half wash':     { Saloon: 12000, SUV: 15000, Van: 15000, Truck: 20000 },
     'Interior only': { Saloon: 15000, SUV: 18000, Pickup: 20000, Van: 18000, Truck: 22000 },
     'Engine':        { Saloon: 8000,  SUV: 10000, Pickup: 12000, Van: 10000, Truck: 15000 },
   };
-  let priceCount = 0;
   for (const [svcName, vcPrices] of Object.entries(priceMatrix)) {
     for (const [vcName, price] of Object.entries(vcPrices)) {
-      await knex.raw(
-        `INSERT INTO prices (org_id, service_id, vehicle_class_id, price_ugx, updated_by)
-         VALUES (?, ?, ?, ?, ?)`,
-        [orgId, svcIds[svcName], vcIds[vcName], price, orgadminId]
+      await ensure(
+        'prices',
+        {
+          sql: 'org_id = ? AND service_id = ? AND vehicle_class_id = ? AND branch_id IS NULL',
+          params: [orgId, svcIds[svcName], vcIds[vcName]],
+        },
+        {
+          columns: 'org_id, service_id, vehicle_class_id, price_ugx, updated_by',
+          values: '?, ?, ?, ?, ?',
+          params: [orgId, svcIds[svcName], vcIds[vcName], price, orgadminId],
+        },
+        `price: ${vcName} ${svcName} = ${price}`
       );
-      priceCount++;
     }
   }
-  console.log(`  ✓ Created ${priceCount} org-wide prices`);
 
-  // 11. Create branch overrides for Ntinda
-  let overrideCount = 0;
-  // Saloon Full: 25,000
-  await knex.raw(
-    `INSERT INTO prices (org_id, service_id, vehicle_class_id, branch_id, price_ugx, updated_by)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-    [orgId, svcIds['Full wash'], vcIds['Saloon'], branch1Id, 25000, managerId]
-  );
-  overrideCount++;
-  // SUV Full: 35,000
-  await knex.raw(
-    `INSERT INTO prices (org_id, service_id, vehicle_class_id, branch_id, price_ugx, updated_by)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-    [orgId, svcIds['Full wash'], vcIds['SUV'], branch1Id, 35000, managerId]
-  );
-  overrideCount++;
-  console.log(`  ✓ Created ${overrideCount} branch overrides for Ntinda Bay`);
+  // Ntinda-specific overrides
+  const overrides: Array<[string, string, number]> = [
+    ['Full wash', 'Saloon', 25000],
+    ['Full wash', 'SUV', 35000],
+  ];
+  for (const [svcName, vcName, price] of overrides) {
+    await ensure(
+      'prices',
+      {
+        sql: 'org_id = ? AND service_id = ? AND vehicle_class_id = ? AND branch_id = ?',
+        params: [orgId, svcIds[svcName], vcIds[vcName], branch1Id],
+      },
+      {
+        columns: 'org_id, service_id, vehicle_class_id, branch_id, price_ugx, updated_by',
+        values: '?, ?, ?, ?, ?, ?',
+        params: [orgId, svcIds[svcName], vcIds[vcName], branch1Id, price, managerId],
+      },
+      `override (NTD): ${vcName} ${svcName} = ${price}`
+    );
+  }
 
-  // 12. Create loyalty config
+  // ── Loyalty config ────────────────────────────────────────────────
+  const loyaltyBefore = await knex.raw(`SELECT org_id FROM loyalty_configs WHERE org_id = ?`, [orgId]);
   await knex.raw(
     `INSERT INTO loyalty_configs (org_id, washes_required, min_amount_ugx)
-     VALUES (?, 7, 10000)
-     ON CONFLICT (org_id) DO NOTHING`,
+     VALUES (?, 7, 10000) ON CONFLICT (org_id) DO NOTHING`,
     [orgId]
   );
-  console.log(`  ✓ Created loyalty config (7 washes = 1 free)`);
+  note(loyaltyBefore.rows.length === 0, 'loyalty config (7 washes = 1 free)');
 
-  // 13. Create second org for tenant isolation testing
-  const org2Result = await knex.raw(
-    `INSERT INTO organizations (name, slug, phone, contact_name, created_by)
-     VALUES (?, ?, ?, ?, ?) RETURNING id`,
-    ['Shine Motors', 'shine', '+256700000099', 'Shine Owner', sysadminId]
+  // ── Org B: Shine Motors (tenant isolation fixture) ────────────────
+  const org2Id = await ensure(
+    'organizations',
+    { sql: 'lower(slug) = lower(?)', params: ['shine'] },
+    {
+      columns: 'name, slug, phone, contact_name, created_by',
+      values: '?, ?, ?, ?, ?',
+      params: ['Shine Motors', 'shine', '+256700000099', 'Shine Owner', sysadminId],
+    },
+    'org: Shine Motors'
   );
-  const org2Id = org2Result.rows[0].id;
-  console.log(`  ✓ Created org: Shine Motors`);
 
-  const org2Branch = await knex.raw(
-    `INSERT INTO branches (org_id, name, code, address, phone)
-     VALUES (?, ?, ?, ?, ?) RETURNING id`,
-    [org2Id, 'Main Bay', 'SHN', '789 Shine Road, Kampala', '+256700000098']
+  const org2BranchId = await ensure(
+    'branches',
+    { sql: 'org_id = ? AND upper(code) = upper(?)', params: [org2Id, 'SHN'] },
+    {
+      columns: 'org_id, name, code, address, phone',
+      values: '?, ?, ?, ?, ?',
+      params: [org2Id, 'Main Bay', 'SHN', '789 Shine Road, Kampala', '+256700000098'],
+    },
+    'branch: Main Bay (SHN)'
   );
-  console.log(`  ✓ Created branch: Main Bay (SHN)`);
 
-  const org2AdminHash = await argon2.hash('Orgadmin123!');
-  await knex.raw(
-    `INSERT INTO staff_users (org_id, branch_id, role, full_name, username, email, password_hash, must_change_password, created_by)
-     VALUES (?, NULL, 'orgadmin', ?, ?, ?, ?, true, NULL)`,
-    [org2Id, 'Shine Admin', 'shineadmin', 'shineadmin@shinemotors.com', org2AdminHash]
+  await ensure(
+    'staff_users',
+    { sql: 'org_id = ? AND lower(username) = lower(?)', params: [org2Id, 'shineadmin'] },
+    {
+      columns: 'org_id, branch_id, role, full_name, username, email, password_hash, must_change_password, created_by',
+      values: '?, NULL, ?, ?, ?, ?, ?, true, NULL',
+      params: [org2Id, 'orgadmin', 'Shine Admin', 'shineadmin', 'shineadmin@shinemotors.com', await argon2.hash('Orgadmin123!')],
+    },
+    'orgadmin: shineadmin / Orgadmin123!'
   );
-  console.log(`  ✓ Created org2 admin: shineadmin / Orgadmin123!`);
 
-  const org2WorkerHash = await argon2.hash('Worker123!');
-  await knex.raw(
-    `INSERT INTO staff_users (org_id, branch_id, role, full_name, username, email, password_hash, must_change_password, created_by)
-     VALUES (?, ?, 'worker', ?, ?, ?, ?, true, NULL)`,
-    [org2Id, org2Branch.rows[0].id, 'Shine Worker', 'shine_worker', 'shineworker@shinemotors.com', org2WorkerHash]
+  await ensure(
+    'staff_users',
+    { sql: 'org_id = ? AND lower(username) = lower(?)', params: [org2Id, 'shine_worker'] },
+    {
+      columns: 'org_id, branch_id, role, full_name, username, email, password_hash, must_change_password, created_by',
+      values: '?, ?, ?, ?, ?, ?, ?, true, NULL',
+      params: [org2Id, org2BranchId, 'worker', 'Shine Worker', 'shine_worker', 'shineworker@shinemotors.com', await argon2.hash('Worker123!')],
+    },
+    'worker: shine_worker / Worker123!'
   );
-  console.log(`  ✓ Created org2 worker: shine_worker / Worker123!`);
 
-  console.log('\n  Seed complete!');
-  console.log(`  Sysadmin: ${sysadminUsername} / ${sysadminPassword}`);
-  console.log(`  All staff passwords must be changed on first login.`);
+  console.log(`\n  Seed complete — ${created} created, ${skipped} already present.`);
+  if (created === 0) console.log('  Nothing to do: the fixture was already in place.');
 }
