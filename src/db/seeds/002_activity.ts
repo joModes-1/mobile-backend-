@@ -196,6 +196,10 @@ export async function seed(knex: Knex): Promise<void> {
   const nearRewardClientId: string | undefined = clients[1]?.id;
 
   let washCount = 0, shiftCount = 0;
+  // Workers whose shift was deliberately left un-closed. The database allows
+  // only one non-closed shift per worker, so once someone is holding cash
+  // they are out of the rota until the story says otherwise.
+  const heldOpen = new Set<string>();
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
@@ -226,21 +230,55 @@ export async function seed(knex: Knex): Promise<void> {
         const showsUp = 0.95 - rosterDepth * 0.6;   // ~95% down to ~35%
         if (!chance(showsUp)) continue;
 
+        // A worker deliberately left holding cash from an earlier day cannot
+        // open another shift — `one_open_shift_per_worker` forbids a second
+        // non-closed row, and that is the real rule too: you hand in
+        // yesterday's takings before you start today.
+        if (heldOpen.has(worker.id)) continue;
+
         // Kabalagala is the quieter branch.
         if (crew.branch.id === kbl.id && chance(0.25)) continue;
 
         const openAt = new Date(day);
         openAt.setHours(8, Math.floor(rnd() * 30), 0, 0);
+        // Seeding early in the morning would otherwise stamp today's shifts
+        // at 08:00 — in the future — and the cash-position report would show
+        // negative hours held. Pull them back to a few hours ago instead.
+        if (isToday && openAt.getTime() > Date.now()) {
+          openAt.setTime(Date.now() - (2 + Math.floor(rnd() * 3)) * 3600 * 1000);
+        }
 
-        // Today's shifts stay open — that is what gives the cash-position
-        // report money "still with workers" to report on.
-        const keepOpen = isToday;
+        // Shifts that never got closed, on purpose.
+        //
+        // The cash-position report measures hours_held from opened_at on any
+        // shift that is not closed, and flags anything past 24 hours as
+        // overdue — money that should have been handed in yesterday and was
+        // not. With every shift closed the same day that alert could never
+        // fire, so the oversight screen an org admin actually opens this app
+        // for had nothing in it. These two are left open days back so the
+        // overdue state is always represented:
+        //   - one worker two days out, one three days out
+        // Chosen by roster position rather than at random so the rows are
+        // there on every run, not just a lucky one.
+        const overdueHolder =
+          (back === 2 && wi === 1) ||   // ~48h
+          (back === 3 && wi === 2);     // ~72h
+
+        // A worker who has asked to close and is waiting on the manager to
+        // count the cash. Distinct from 'open': the money is counted but the
+        // handover is not confirmed, which is its own column on the screen.
+        const pendingClose = back === 1 && wi === 0;
+
+        const keepOpen = isToday || overdueHolder;
+        const status = pendingClose ? 'pending_close' : keepOpen ? 'open' : 'closed';
+
         const shift = await one(
           `INSERT INTO shifts (org_id, branch_id, worker_id, status, opened_at)
            VALUES (?, ?, ?, ?, ?) RETURNING id`,
-          [orgId, crew.branch.id, worker.id, keepOpen ? 'open' : 'closed', openAt.toISOString()]
+          [orgId, crew.branch.id, worker.id, status, openAt.toISOString()]
         );
         shiftCount++;
+        if (status !== 'closed') heldOpen.add(worker.id);
 
         // Faster hands at the top of the roster take more cars per shift, so
         // the gap between first and last place comes from real throughput
@@ -261,6 +299,10 @@ export async function seed(knex: Knex): Promise<void> {
 
           const startAt = new Date(openAt);
           startAt.setMinutes(startAt.getMinutes() + 25 + i * (40 + Math.floor(rnd() * 25)));
+          // A job cannot have started later than right now. On today's shift
+          // the spacing can run past the clock, which would date-stamp work
+          // into the future and skew every "today" figure.
+          if (startAt.getTime() > Date.now()) break;
 
           const { jobNo } = nextJobNo(crew.branch.code, crew.branch.id, day);
           const client = chance(0.72) ? pick(clients) : null;   // rest are walk-ins
@@ -362,6 +404,69 @@ export async function seed(knex: Knex): Promise<void> {
           );
           washCount++;
 
+          // --- After-the-fact exceptions on a settled job ---
+          // These only happen to jobs already settled, which is why they are
+          // applied here rather than as another wash status above. Skipped
+          // for today so the freshly-settled jobs stay clean, and skipped for
+          // redemptions where the money movement is already unusual.
+          if (!isToday && !isRedemption && client) {
+            // A customer queries the charge. Still counts as revenue while
+            // open — the manager resolves it — so the day's takings do not
+            // move under anyone's feet.
+            if (chance(0.02)) {
+              await knex.raw(
+                `UPDATE washes SET status='disputed', disputed_at=?, dispute_reason=? WHERE id=?`,
+                [new Date(settledAt.getTime() + 40 * 60 * 1000).toISOString(),
+                 pick(['amount_wrong', 'service_wrong', 'car_type_wrong', 'never_washed', 'already_paid', 'other']),
+                 wash.id]
+              );
+              // No longer status='settled', so it leaves the shift's cash sum.
+              expectedCash -= amount;
+            }
+            // Recorded as the wrong car type and corrected afterwards. The
+            // original amount is kept so the correction is auditable.
+            else if (chance(0.025)) {
+              const otherVc = vcs.find((v: any) => v.id !== vc.id);
+              const newPrice = otherVc ? priceOf(svc.id, otherVc.id, crew.branch.id) : null;
+              if (otherVc && newPrice != null && newPrice !== amount) {
+                await knex.raw(
+                  `UPDATE washes SET corrected_at=?, corrected_by=?, original_amount_ugx=?,
+                     original_vehicle_class_id=?, vehicle_class_id=?, amount_ugx=? WHERE id=?`,
+                  [new Date(settledAt.getTime() + 55 * 60 * 1000).toISOString(), grace?.id ?? null,
+                   amount, vc.id, otherVc.id, newPrice, wash.id]
+                );
+                // Still settled, but for a different amount — the shift's
+                // expected cash follows the corrected figure.
+                expectedCash += newPrice - amount;
+              }
+            }
+            // A job that should never have been billed at all. Reversed, not
+            // deleted, and the loyalty point it earned is taken back below.
+            else if (chance(0.015)) {
+              await knex.raw(
+                `UPDATE washes SET status='reversed', reversed_at=?, reversed_by=?, reverse_reason=? WHERE id=?`,
+                [new Date(settledAt.getTime() + 3 * 3600 * 1000).toISOString(), grace?.id ?? null,
+                 pick(['Charged in error', 'Duplicate job', 'Customer never collected']), wash.id]
+              );
+              // Only claw the point back if there is one to take. Clamping
+              // the balance at zero while still writing a -1 ledger row is
+              // what made the account and its ledger disagree; the delta
+              // recorded has to be the movement that actually happened.
+              if (bal && svc.earns_point && amount >= minAmount && bal.wash > 0) {
+                bal.wash -= 1;
+                bal.lifetimeW = Math.max(0, bal.lifetimeW - 1);
+                ledger.push({ client_id: client.id, wash_id: wash.id, entry_type: 'reversal',
+                  wash_delta: -1, credit_delta: 0, wash_count_after: bal.wash, credits_after: bal.credits,
+                  reason: 'Wash reversed', created_at: new Date(settledAt.getTime() + 3 * 3600 * 1000).toISOString() });
+              }
+              // The shift total was incremented when this settled; a reversal
+              // takes the money back out, or the shift's expected cash would
+              // no longer match the washes actually settled into it.
+              expectedCash -= amount;
+              continue;
+            }
+          }
+
           // --- Loyalty, in step with the wash that caused it ---
           if (client && bal) {
             if (isRedemption) {
@@ -391,7 +496,7 @@ export async function seed(knex: Knex): Promise<void> {
         }
 
         // --- Close the shift, with cash that reconciles ---
-        if (!keepOpen) {
+        if (status === 'closed') {
           const closeAt = new Date(day);
           closeAt.setHours(17, 30 + Math.floor(rnd() * 25), 0, 0);
           // Most tills balance; some are out by a small amount either way.
@@ -401,6 +506,16 @@ export async function seed(knex: Knex): Promise<void> {
             `UPDATE shifts SET status='closed', closed_at=?, expected_cash_ugx=?, counted_cash_ugx=?,
                variance_ugx=?, closed_by=? WHERE id=?`,
             [closeAt.toISOString(), expectedCash, counted, counted - expectedCash, grace?.id ?? null, shift.id]
+          );
+        } else if (status === 'pending_close') {
+          // The worker has counted and submitted; the manager has not yet
+          // confirmed. Expected and counted are known, but closed_at and
+          // closed_by stay null because nobody has signed it off.
+          const off = chance(0.4) ? (chance(0.5) ? 1 : -1) * (1000 + Math.floor(rnd() * 4) * 1000) : 0;
+          const counted = Math.max(0, expectedCash + off);
+          await knex.raw(
+            `UPDATE shifts SET expected_cash_ugx=?, counted_cash_ugx=?, variance_ugx=? WHERE id=?`,
+            [expectedCash, counted, counted - expectedCash, shift.id]
           );
         }
       }
