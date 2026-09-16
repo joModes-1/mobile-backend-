@@ -8,10 +8,13 @@ services:
     #
     # Migrations run on every deploy, not just the first: `knex migrate:latest`
     # only applies migrations that haven't run yet, so a redeploy with no new
-    # migration files is a safe no-op. Seeding is NOT run here on purpose —
-    # `npm run seed` is meant to run once against an empty database (it would
-    # duplicate or fight with real data on every subsequent deploy) — run it
-    # manually from Render's shell after the very first successful deploy.
+    # migration files is a safe no-op.
+    #
+    # Seeding is left out of the build command, though no longer because it is
+    # dangerous — both seeders are idempotent now and only add what is missing,
+    # so repeating them changes nothing. It stays out because seeding a fresh
+    # database once, deliberately, is clearer than doing it on every deploy;
+    # run `npm run seed` from Render's shell after the first deploy.
     buildCommand: npm install && npm run build && npm run migrate
     startCommand: npm start
     healthCheckPath: /api/v1/health
