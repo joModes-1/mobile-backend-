@@ -56,16 +56,20 @@ export async function seed(knex: Knex): Promise<void> {
   const sysadminUsername = env.SEED_SYSADMIN_USERNAME || 'sysadmin';
   const sysadminPassword = env.SEED_SYSADMIN_PASSWORD || 'admin123';
 
+  const sysadminPhone = '+256700200000';
   const sysadminId = await ensure(
     'platform_admins',
     { sql: 'lower(username) = lower(?)', params: [sysadminUsername] },
     {
-      columns: 'full_name, username, email, password_hash, must_change_password',
-      values: '?, ?, ?, ?, true',
-      params: ['System Administrator', sysadminUsername, sysadminEmail, await argon2.hash(sysadminPassword)],
+      columns: 'full_name, username, email, phone, password_hash, must_change_password',
+      values: '?, ?, ?, ?, ?, true',
+      params: ['System Administrator', sysadminUsername, sysadminEmail, sysadminPhone, await argon2.hash(sysadminPassword)],
     },
-    `sysadmin: ${sysadminUsername} / ${sysadminPassword}`
+    `sysadmin: ${sysadminUsername} / ${sysadminPassword} / ${sysadminPhone}`
   );
+  // Backfilled the same way as staff phones — an account that already
+  // existed before this seeder added the phone-login flow still needs one.
+  await knex.raw(`UPDATE platform_admins SET phone = ? WHERE id = ?`, [sysadminPhone, sysadminId]);
 
   // ── Org A: Demo Car Wash ──────────────────────────────────────────
   const orgId = await ensure(
@@ -102,27 +106,38 @@ export async function seed(knex: Knex): Promise<void> {
   );
 
   // ── Staff ─────────────────────────────────────────────────────────
-  /** Staff are unique per (org, username). Password only set on creation. */
+  /**
+   * Staff are unique per (org, username). Password only set on creation.
+   *
+   * Phone is backfilled unconditionally, even for an account that already
+   * existed — the phone-login flow needs one on every staff row to be
+   * testable, and a phone number carries no password-reset implication the
+   * way silently changing a password would, so updating it on every run is
+   * safe.
+   */
   async function ensureStaff(
     username: string, fullName: string, role: string,
-    branchId: string | null, email: string, password: string, createdBy: string | null
+    branchId: string | null, email: string, password: string,
+    createdBy: string | null, phone: string
   ): Promise<string> {
-    return ensure(
+    const id = await ensure(
       'staff_users',
       { sql: 'org_id = ? AND lower(username) = lower(?)', params: [orgId, username] },
       {
-        columns: 'org_id, branch_id, role, full_name, username, email, password_hash, must_change_password, created_by',
-        values: '?, ?, ?, ?, ?, ?, ?, true, ?',
-        params: [orgId, branchId, role, fullName, username, email, await argon2.hash(password), createdBy],
+        columns: 'org_id, branch_id, role, full_name, username, email, phone, password_hash, must_change_password, created_by',
+        values: '?, ?, ?, ?, ?, ?, ?, ?, true, ?',
+        params: [orgId, branchId, role, fullName, username, email, phone, await argon2.hash(password), createdBy],
       },
-      `${role}: ${username} / ${password}`
+      `${role}: ${username} / ${password} / ${phone}`
     );
+    await knex.raw(`UPDATE staff_users SET phone = ? WHERE id = ?`, [phone, id]);
+    return id;
   }
 
-  const orgadminId = await ensureStaff('orgadmin', 'Org Admin', 'orgadmin', null, 'admin@democarwash.com', 'Orgadmin123!', null);
-  const managerId = await ensureStaff('grace', 'Grace N.', 'manager', branch1Id, 'grace@democarwash.com', 'Manager123!', orgadminId);
-  await ensureStaff('joseph', 'Joseph K.', 'worker', branch1Id, 'joseph@democarwash.com', 'Worker123!', managerId);
-  await ensureStaff('musa', 'Musa K.', 'worker', branch1Id, 'musa@democarwash.com', 'Worker123!', managerId);
+  const orgadminId = await ensureStaff('orgadmin', 'Org Admin', 'orgadmin', null, 'admin@democarwash.com', 'Orgadmin123!', null, '+256700200001');
+  const managerId = await ensureStaff('grace', 'Grace N.', 'manager', branch1Id, 'grace@democarwash.com', 'Manager123!', orgadminId, '+256700200002');
+  await ensureStaff('joseph', 'Joseph K.', 'worker', branch1Id, 'joseph@democarwash.com', 'Worker123!', managerId, '+256700200003');
+  await ensureStaff('musa', 'Musa K.', 'worker', branch1Id, 'musa@democarwash.com', 'Worker123!', managerId, '+256700200004');
 
   // ── Client ────────────────────────────────────────────────────────
   function memberCode(): string {
@@ -138,9 +153,9 @@ export async function seed(knex: Knex): Promise<void> {
     {
       columns: 'org_id, full_name, phone, member_code, phone_verified, username, email, email_verified, password_hash',
       values: '?, ?, ?, ?, true, ?, ?, true, ?',
-      params: [orgId, 'Peter O.', '+256700123456', memberCode(), 'peter_o', 'peter.o@example.com', await argon2.hash('Client123!')],
+      params: [orgId, 'Peter O.', '+256700200099', memberCode(), 'peter_o', 'peter.o@example.com', await argon2.hash('Client123!')],
     },
-    'client: peter_o / Client123!'
+    'client: peter_o / Client123! / +256700200099'
   );
 
   // ── Catalogue ─────────────────────────────────────────────────────
@@ -270,27 +285,29 @@ export async function seed(knex: Knex): Promise<void> {
     'branch: Main Bay (SHN)'
   );
 
-  await ensure(
+  const shineAdminId = await ensure(
     'staff_users',
     { sql: 'org_id = ? AND lower(username) = lower(?)', params: [org2Id, 'shineadmin'] },
     {
-      columns: 'org_id, branch_id, role, full_name, username, email, password_hash, must_change_password, created_by',
-      values: '?, NULL, ?, ?, ?, ?, ?, true, NULL',
-      params: [org2Id, 'orgadmin', 'Shine Admin', 'shineadmin', 'shineadmin@shinemotors.com', await argon2.hash('Orgadmin123!')],
+      columns: 'org_id, branch_id, role, full_name, username, email, phone, password_hash, must_change_password, created_by',
+      values: '?, NULL, ?, ?, ?, ?, ?, ?, true, NULL',
+      params: [org2Id, 'orgadmin', 'Shine Admin', 'shineadmin', 'shineadmin@shinemotors.com', '+256700200005', await argon2.hash('Orgadmin123!')],
     },
-    'orgadmin: shineadmin / Orgadmin123!'
+    'orgadmin: shineadmin / Orgadmin123! / +256700200005'
   );
+  await knex.raw(`UPDATE staff_users SET phone = ? WHERE id = ?`, ['+256700200005', shineAdminId]);
 
-  await ensure(
+  const shineWorkerId = await ensure(
     'staff_users',
     { sql: 'org_id = ? AND lower(username) = lower(?)', params: [org2Id, 'shine_worker'] },
     {
-      columns: 'org_id, branch_id, role, full_name, username, email, password_hash, must_change_password, created_by',
-      values: '?, ?, ?, ?, ?, ?, ?, true, NULL',
-      params: [org2Id, org2BranchId, 'worker', 'Shine Worker', 'shine_worker', 'shineworker@shinemotors.com', await argon2.hash('Worker123!')],
+      columns: 'org_id, branch_id, role, full_name, username, email, phone, password_hash, must_change_password, created_by',
+      values: '?, ?, ?, ?, ?, ?, ?, ?, true, NULL',
+      params: [org2Id, org2BranchId, 'worker', 'Shine Worker', 'shine_worker', 'shineworker@shinemotors.com', '+256700200006', await argon2.hash('Worker123!')],
     },
-    'worker: shine_worker / Worker123!'
+    'worker: shine_worker / Worker123! / +256700200006'
   );
+  await knex.raw(`UPDATE staff_users SET phone = ? WHERE id = ?`, ['+256700200006', shineWorkerId]);
 
   console.log(`\n  Seed complete — ${created} created, ${skipped} already present.`);
   if (created === 0) console.log('  Nothing to do: the fixture was already in place.');

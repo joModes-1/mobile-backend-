@@ -5,6 +5,7 @@ import { createAppError } from '@/middleware/errorHandler';
 import { requireRole, getOrgId } from '@/middleware/requireRole';
 import { consumeToken, hashToken } from '@/modules/tokens/tokenRoutes';
 import { processSettlement, ensureAccount } from '@/modules/loyalty';
+import { awardForSettlement as awardWorkerPoints } from '@/modules/workerPoints';
 import { notify } from '@/modules/notify';
 
 const router = Router();
@@ -56,6 +57,9 @@ const startSchema = z.object({
   service_id: z.string().uuid().optional(),
   vehicle_class_id: z.string().uuid(),
   plate: z.string().optional(),
+  // Captured on the car-details step: two identical silver saloons in the
+  // yard are told apart by colour, not by plate the worker cannot see.
+  vehicle_color: z.string().max(40).optional(),
   use_free_wash: z.boolean().optional().default(false),
 });
 
@@ -233,15 +237,16 @@ router.post('/', requireRole('orgadmin', 'manager', 'worker'), async (req: Reque
     const washResult = await client.query(
       `INSERT INTO washes (
         org_id, branch_id, started_by_worker_id, started_shift_id,
-        client_id, client_attach_method, plate,
+        client_id, client_attach_method, plate, vehicle_color,
         service_id, vehicle_class_id, price_id,
         quoted_amount_ugx, is_redemption, earns_point,
         job_no, status, start_verified, idempotency_key, started_date
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'in_progress',$15,$16, CURRENT_DATE)
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'in_progress',$16,$17, CURRENT_DATE)
       RETURNING *`,
       [
         orgId, branchId, workerId, shift.id,
         clientId, clientAttachMethod, req.body.plate || null,
+        req.body.vehicle_color || null,
         serviceId, req.body.vehicle_class_id, price.id,
         price.price_ugx, isRedemption, service.earns_point,
         jobNo, startVerified, idempotencyKey || null,
@@ -427,6 +432,9 @@ const settleByTokenSchema = z.object({
   pay_token: z.string().min(1),
   handover_reason: z.string().optional(),
   handover_note: z.string().optional(),
+  payment_method: z.enum(['cash', 'mtn', 'airtel']).optional(),
+  payer_phone: z.string().max(20).optional(),
+  payment_ref: z.string().max(64).optional(),
 });
 
 router.post('/settle-by-token', requireRole('orgadmin', 'manager', 'worker'), async (req: Request, res: Response, next: NextFunction) => {
@@ -474,6 +482,9 @@ router.post('/settle-by-token', requireRole('orgadmin', 'manager', 'worker'), as
       clientId: pending.client_id,
       handoverReason: body.handover_reason,
       handoverNote: body.handover_note,
+      paymentMethod: body.payment_method,
+      payerPhone: body.payer_phone,
+      paymentRef: body.payment_ref,
     }, res, next);
   } catch (err) {
     next(err);
@@ -487,6 +498,13 @@ const settleSchema = z.object({
   unverified_reason: z.enum(['dead_phone', 'no_app', 'app_error']).optional(),
   handover_reason: z.enum(['starter_off_shift', 'starter_on_break', 'starter_phone_unusable', 'starter_left_for_day', 'other']).optional(),
   handover_note: z.string().optional(),
+  // How the money arrived. Defaults to cash when omitted, which keeps every
+  // existing caller working unchanged.
+  payment_method: z.enum(['cash', 'mtn', 'airtel']).optional(),
+  // The number a mobile money payment was requested from, for matching
+  // against a statement later.
+  payer_phone: z.string().max(20).optional(),
+  payment_ref: z.string().max(64).optional(),
 });
 
 router.post('/:id/settle', requireRole('orgadmin', 'manager', 'worker'), async (req: Request, res: Response, next: NextFunction) => {
@@ -532,6 +550,9 @@ router.post('/:id/settle', requireRole('orgadmin', 'manager', 'worker'), async (
       unverifiedReason: body.unverified_reason,
       handoverReason: body.handover_reason,
       handoverNote: body.handover_note,
+      paymentMethod: body.payment_method,
+      payerPhone: body.payer_phone,
+      paymentRef: body.payment_ref,
     }, res, next);
   } catch (err) {
     next(err);
@@ -554,6 +575,10 @@ interface SettleOpts {
   unverifiedReason?: string;
   handoverReason?: string;
   handoverNote?: string;
+  /** Defaults to cash when not given, which is what it always was. */
+  paymentMethod?: string;
+  payerPhone?: string;
+  paymentRef?: string;
 }
 
 async function settleWash(
@@ -656,8 +681,11 @@ async function settleWash(
         unverified_reason = $5,
         handover_reason = $6,
         handover_note = $7,
+        payment_method = $8,
+        payer_phone = $9,
+        payment_ref = $10,
         updated_at = now()
-       WHERE id = $8`,
+       WHERE id = $11`,
       [
         opts.workerId,
         shift.id,
@@ -666,6 +694,11 @@ async function settleWash(
         opts.unverifiedReason || null,
         opts.handoverReason || null,
         opts.handoverNote || null,
+        // A free wash is its own method: no money moved, so it should not
+        // be counted as cash the worker is holding.
+        wash.is_redemption ? 'free' : (opts.paymentMethod || 'cash'),
+        opts.payerPhone || null,
+        opts.paymentRef || null,
         washId,
       ]
     );
@@ -692,6 +725,19 @@ async function settleWash(
         opts.workerId
       );
     }
+
+    // 8b. Worker points — the staff side of the same moment. Inside this
+    // transaction on purpose: if the settlement rolls back the payout has
+    // to roll back with it, or a worker keeps points for a wash that never
+    // happened. A walk-in with no client_id still earns the worker points;
+    // the work was done either way.
+    const workerPointsResult = await awardWorkerPoints(client, {
+      staffId: opts.workerId,
+      orgId: opts.orgId,
+      washId,
+      amountUgx,
+      isRedemption: wash.is_redemption,
+    });
 
     // Burn the customer's pay token as part of this transaction — see the
     // note in /settle-by-token. Guarded on consumed_at so two workers racing
@@ -747,6 +793,13 @@ async function settleWash(
           wash_count: loyaltyResult.account.wash_count,
           free_wash_credits: loyaltyResult.account.free_wash_credits,
           reward_granted: loyaltyResult.rewardGranted,
+        } : null,
+        // What this job earned the worker, so the app can show it on the
+        // receipt the way the customer's stamp is shown. Null when the
+        // scheme is off or the wash was free.
+        worker_points: workerPointsResult ? {
+          earned: workerPointsResult.points,
+          balance: workerPointsResult.account.points_balance,
         } : null,
       },
     });

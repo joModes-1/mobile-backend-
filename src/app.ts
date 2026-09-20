@@ -15,6 +15,7 @@ import { createAppError } from '@/middleware/errorHandler';
 import platformAuthRouter from '@/modules/auth/platformAuth';
 import staffAuthRouter from '@/modules/auth/staffAuth';
 import clientAuthRouter from '@/modules/clients/clientAuth';
+import phoneAuthRouter from '@/modules/auth/phoneAuth';
 import meRouter from '@/modules/auth/meRouter';
 
 // Platform routes
@@ -28,6 +29,7 @@ import branchRouter from '@/modules/branches/branchRoutes';
 import catalogueRouter from '@/modules/catalogue/catalogueRoutes';
 import priceRouter from '@/modules/pricing/priceRoutes';
 import shiftRouter from '@/modules/shifts/shiftRoutes';
+import workerPointsRouter from '@/modules/workerPoints/pointsRoutes';
 import deviceRouter from '@/modules/clients/deviceRoutes';
 
 // Phase 4 routes
@@ -67,6 +69,7 @@ app.get('/api/v1/health', (_req, res) => {
 app.use('/api/v1/auth/platform', platformAuthRouter);
 app.use('/api/v1/auth/staff', staffAuthRouter);
 app.use('/api/v1/auth/client', clientAuthRouter);
+app.use('/api/v1/auth/phone', phoneAuthRouter);
 
 // Global auth + password-changed check for all protected routes
 app.use('/api/v1/me', authenticate, requirePasswordChanged, meRouter);
@@ -76,6 +79,7 @@ app.use('/api/v1/branches', authenticate, requirePasswordChanged, branchRouter);
 app.use('/api/v1', authenticate, requirePasswordChanged, catalogueRouter);
 app.use('/api/v1/prices', authenticate, requirePasswordChanged, priceRouter);
 app.use('/api/v1/shifts', authenticate, requirePasswordChanged, shiftRouter);
+app.use('/api/v1/worker-points', authenticate, requirePasswordChanged, workerPointsRouter);
 app.use('/api/v1/me/device', authenticate, requirePasswordChanged, deviceRouter);
 
 // Phase 4: Wash lifecycle

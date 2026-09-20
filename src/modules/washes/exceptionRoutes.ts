@@ -4,6 +4,7 @@ import { getPool } from '@/db';
 import { createAppError } from '@/middleware/errorHandler';
 import { requireRole, getOrgId } from '@/middleware/requireRole';
 import { processSettlement, lockAccount, ensureAccount, getConfig, writeLedgerEntry } from '@/modules/loyalty';
+import { reverseForWash as reverseWorkerPoints } from '@/modules/workerPoints';
 import { resolvePrice } from '@/modules/pricing/resolvePrice';
 import { notify } from '@/modules/notify';
 
@@ -212,6 +213,16 @@ router.post('/:id/reverse', requireRole('orgadmin', 'manager'), async (req: Requ
        WHERE id = $3`,
       [managerId, body.reason, id]
     );
+
+    // Worker points reversal. The wash did not happen, so the points it
+    // paid out should not stay in a worker's total. Clamped at zero inside
+    // the module — a reversal after the points were already spent is the
+    // org's loss to absorb, not a debt taken off someone's next shift.
+    await reverseWorkerPoints(client, {
+      orgId,
+      washId: id,
+      reversedBy: managerId,
+    });
 
     // Loyalty reversal (if client attached)
     let loyaltyResult: any = null;

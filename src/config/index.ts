@@ -28,6 +28,24 @@ const envSchema = z.object({
   // report is still saved and visible in the app, it just is not emailed —
   // support must not break because SMTP has not been set up yet.
   SUPPORT_EMAIL: z.string().optional(),
+
+  // Africa's Talking, for SMS verification codes. Both optional: without
+  // them SMS is simply off and the app falls back to email signup.
+  //
+  // Named AFRICASTALKING_USERNAME rather than USERNAME on purpose — USERNAME
+  // is a built-in Windows environment variable, and dotenv will not override
+  // one that already exists, so the file value was being silently ignored in
+  // favour of the developer's Windows login name.
+  AFRICASTALKING_USERNAME: z.string().optional(),
+  AFRICASTALKING: z.string().optional(),
+
+  // Set true while testing signup/login flows without spending real SMS
+  // credit. With this on, sendOtpSms talks to the sandbox endpoint and the
+  // OTP is always returned in the API response — sandbox never actually
+  // delivers to a handset, so without this, "the code arrived" would have
+  // no way to happen at all.
+  TEST_MODE: z.enum(['true', 'false', '1', '0', '']).default('false')
+    .transform((v) => v === 'true' || v === '1'),
 });
 
 export type Env = z.infer<typeof envSchema>;
