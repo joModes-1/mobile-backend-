@@ -132,6 +132,38 @@ export async function notify(
       })));
       break;
 
+    // ── Manager-facing operational alerts ──
+    // These two exist because the nightly summary and the stale-wash alert
+    // used to be sent as 'wash_started', passing their text through that
+    // template's `service_name` slot. A manager's phone read "Wash Started —
+    // Your Daily Summary wash (…) is in progress. Quoted: UGX 0". They are
+    // their own events now so the copy can say what it means, and so an
+    // edit to the customer-facing wash copy cannot silently rewrite them.
+
+    case 'stale_wash':
+      messages.push(...tokens.map((to) => ({
+        to,
+        title: 'Car waiting too long',
+        body: `Job ${payload.job_no || ''} has been ready for over ${payload.minutes || 0} minutes at ${payload.branch_name || 'the bay'}.`,
+        data: { event, wash_id: payload.wash_id, job_no: payload.job_no },
+        sound: 'default',
+      })));
+      break;
+
+    case 'daily_summary':
+      messages.push(...tokens.map((to) => ({
+        to,
+        title: `${payload.branch_name || 'Branch'} — yesterday`,
+        body:
+          `${payload.washes ?? 0} washes · UGX ${Number(payload.gross_ugx || 0).toLocaleString()}` +
+          (Number(payload.variance_ugx || 0) !== 0
+            ? ` · variance UGX ${Number(payload.variance_ugx).toLocaleString()}`
+            : ''),
+        data: { event, date: payload.date, branch_id: payload.branch_id },
+        sound: 'default',
+      })));
+      break;
+
     default:
       console.log(`[NOTIFY] Unknown event: ${event}`);
       return;

@@ -26,6 +26,10 @@ const updateBranchSchema = z.object({
   latitude: z.number().optional(),
   longitude: z.number().optional(),
   ready_alert_minutes: z.number().min(1).optional(),
+  // The worker's cut, as a percentage. Accepted as a percent because that
+  // is what an admin types; stored as basis points so the split is exact
+  // integer arithmetic. One decimal place is as fine as the UI allows.
+  worker_commission_pct: z.number().min(0).max(100).optional(),
 });
 
 /**
@@ -71,7 +75,7 @@ router.get('/', requireRole('orgadmin', 'manager'), async (req: Request, res: Re
 
     let query = `
       SELECT b.id, b.name, b.code, b.address, b.phone, b.latitude, b.longitude,
-             b.ready_alert_minutes, b.status, b.created_at,
+             b.ready_alert_minutes, b.status, b.created_at, b.worker_commission_bp,
              -- Active only. Counting suspended staff told an org admin a
              -- branch had more people working it than actually could —
              -- a suspended account cannot open a shift or wash a car.
@@ -110,7 +114,7 @@ router.get('/:id', requireRole('orgadmin', 'manager'), async (req: Request, res:
 
     const result = await pool.query(
       `SELECT b.id, b.name, b.code, b.address, b.phone, b.latitude, b.longitude,
-              b.ready_alert_minutes, b.status, b.created_at,
+              b.ready_alert_minutes, b.status, b.created_at, b.worker_commission_bp,
               -- Active only, same reasoning as the list query above.
               (SELECT COUNT(*) FROM staff_users
                 WHERE branch_id = b.id AND status = 'active') as staff_count,
@@ -159,6 +163,13 @@ router.patch('/:id', requireRole('orgadmin'), async (req: Request, res: Response
     if (data.latitude !== undefined) { updates.push(`latitude = $${paramIndex++}`); values.push(data.latitude); }
     if (data.longitude !== undefined) { updates.push(`longitude = $${paramIndex++}`); values.push(data.longitude); }
     if (data.ready_alert_minutes) { updates.push(`ready_alert_minutes = $${paramIndex++}`); values.push(data.ready_alert_minutes); }
+    if (data.worker_commission_pct !== undefined) {
+      // Percent in, basis points stored. Rounded because a percent with
+      // more than one decimal cannot be represented exactly in bp anyway,
+      // and silently truncating would set a different rate than was typed.
+      updates.push(`worker_commission_bp = $${paramIndex++}`);
+      values.push(Math.round(data.worker_commission_pct * 100));
+    }
 
     if (updates.length === 0) {
       next(createAppError(400, 'NO_CHANGES', 'No fields to update'));

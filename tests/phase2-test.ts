@@ -160,6 +160,10 @@ async function main() {
   check('Price history from audit_logs', history.ok && history.data.length > 0);
 
   console.log('\n=== Results: ' + passCount + ' passed, ' + failCount + ' failed ===');
+  // Exit non-zero on failure, like every other phase script. Without this a
+  // failing run still exited 0, so nothing calling it could tell the
+  // difference between a pass and a wall of ✗.
+  process.exit(failCount > 0 ? 1 : 0);
 }
 
-main().catch(console.error);
+main().catch((e) => { console.error(e); process.exit(1); });

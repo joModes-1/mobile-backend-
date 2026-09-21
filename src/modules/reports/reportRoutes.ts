@@ -49,6 +49,11 @@ router.get('/daily', requireRole('orgadmin', 'manager'), async (req: Request, re
         COUNT(*) FILTER (WHERE status = 'cancelled') AS cancelled_washes,
         COUNT(*) FILTER (WHERE status = 'reversed') AS reversed_washes,
         COALESCE(SUM(amount_ugx) FILTER (WHERE status = 'settled'), 0) AS gross_ugx,
+        -- What the workers kept, and what the business is therefore left
+        -- with. gross_ugx stays the full amount charged the customer;
+        -- net_ugx is the figure that should match banked cash.
+        COALESCE(SUM(worker_commission_ugx) FILTER (WHERE status = 'settled'), 0) AS worker_commission_ugx,
+        COALESCE(SUM(amount_ugx - worker_commission_ugx) FILTER (WHERE status = 'settled'), 0) AS net_ugx,
         COUNT(*) FILTER (WHERE status = 'settled' AND is_redemption) AS redemption_count,
         COALESCE(SUM(quoted_amount_ugx) FILTER (WHERE status = 'settled' AND is_redemption), 0) AS redemption_value_ugx,
         COUNT(*) FILTER (WHERE status = 'settled' AND client_id IS NULL) AS walkin_count,

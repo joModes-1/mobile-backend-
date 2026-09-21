@@ -7,6 +7,7 @@ import { authenticate } from '@/middleware/auth';
 import { requireRole, getOrgId, getBranchId } from '@/middleware/requireRole';
 import { generateTempPassword } from '@/utils/tempPassword';
 import { sendStaffTempPasswordEmail } from '@/utils/email';
+import { normalizeUgPhone, displayUgPhone } from '@/utils/sms';
 
 const router = Router();
 
@@ -20,11 +21,16 @@ const ROLE_RANK: Record<string, number> = {
 };
 
 // Validation schemas
+//
+// Phone is how staff actually sign in (phone + OTP), so it is required on
+// creation and carries the uniqueness. Username stays as the internal
+// handle shown in listings and audit entries; email is optional contact
+// detail only — nothing is sent to it.
 const createStaffSchema = z.object({
   full_name: z.string().min(1),
   username: z.string().min(1),
   email: z.string().email().optional(),
-  phone: z.string().optional(),
+  phone: z.string().min(9),
   role: z.enum(['orgadmin', 'manager', 'worker']),
   branch_id: z.string().uuid().optional(),
 });
@@ -32,7 +38,7 @@ const createStaffSchema = z.object({
 const updateStaffSchema = z.object({
   full_name: z.string().min(1).optional(),
   email: z.string().email().optional(),
-  phone: z.string().optional(),
+  phone: z.string().min(9).optional(),
   role: z.enum(['orgadmin', 'manager', 'worker']).optional(),
   branch_id: z.string().uuid().optional(),
 });
@@ -52,6 +58,23 @@ router.post('/', requireRole('orgadmin', 'manager'), async (req: Request, res: R
     const data = createStaffSchema.parse(req.body);
     const orgId = getOrgId(req.actor!);
     const pool = getPool();
+
+    // Phone is the sign-in identity, so it has to be stored in the same
+    // canonical form the login path normalises to — otherwise the account
+    // exists but the number never matches at sign-in.
+    const phone = normalizeUgPhone(data.phone);
+    if (!phone) {
+      next(createAppError(422, 'INVALID_PHONE', 'Enter a valid Ugandan mobile number'));
+      return;
+    }
+
+    // One number, one account — across every org and role, since phone
+    // login resolves a number without knowing which org it belongs to.
+    const phoneTaken = await pool.query('SELECT id FROM staff_users WHERE phone = $1 LIMIT 1', [phone]);
+    if (phoneTaken.rows.length > 0) {
+      next(createAppError(409, 'PHONE_TAKEN', 'Another staff member already uses this number'));
+      return;
+    }
 
     // Managers can only create workers in their own branch
     if (req.actor!.role === 'manager') {
@@ -87,14 +110,14 @@ router.post('/', requireRole('orgadmin', 'manager'), async (req: Request, res: R
       }
     }
 
-    // Generate temp password
-    const tempPassword = generateTempPassword();
-    const passwordHash = await argon2.hash(tempPassword);
-
+    // No password and nothing emailed: staff sign in with their phone and a
+    // one-time code. `must_change_password` is false because there is no
+    // password to change — leaving it true would send them straight to the
+    // change-password screen on first sign-in with nothing to enter.
     const result = await pool.query(
       `INSERT INTO staff_users (org_id, branch_id, role, full_name, username, email, phone, password_hash, must_change_password, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9) RETURNING id`,
-      [orgId, data.branch_id || null, data.role, data.full_name, data.username, data.email || null, data.phone || null, passwordHash, req.actor!.sub]
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, false, $8) RETURNING id`,
+      [orgId, data.branch_id || null, data.role, data.full_name, data.username, data.email || null, phone, req.actor!.sub]
     );
 
     // Audit
@@ -104,29 +127,13 @@ router.post('/', requireRole('orgadmin', 'manager'), async (req: Request, res: R
       [orgId, req.actor!.sub, result.rows[0].id, JSON.stringify({ role: data.role, username: data.username })]
     );
 
-    // Best-effort: the staff row is already committed, so a mail failure must
-    // not turn a created account into a 500. It previously threw straight out
-    // of the handler — the worker existed but the caller saw an error and no
-    // password. `emailed` also assumed success from merely having an address.
-    let emailed = false;
-    if (data.email) {
-      try {
-        await sendStaffTempPasswordEmail(data.email, data.full_name, data.username, tempPassword, 'created');
-        emailed = true;
-      } catch (mailErr) {
-        console.error(`[email] temp password to ${data.email} failed:`, mailErr);
-      }
-    }
-
     res.status(201).json({
       ok: true,
       data: {
         staff_id: result.rows[0].id,
-        temp_password: tempPassword,
-        emailed,
-        message: emailed
-          ? 'Staff member created. The temp password has also been emailed to them.'
-          : 'Staff member created. No email on file — share the temp password directly. It will not be shown again.',
+        phone,
+        phone_display: displayUgPhone(phone),
+        message: `Staff member created. They sign in with ${displayUgPhone(phone)} and the code sent to that phone.`,
       },
     });
   } catch (err) {
@@ -225,6 +232,26 @@ router.patch('/:id', requireRole('orgadmin', 'manager'), async (req: Request, re
       return;
     }
 
+    // Same normalisation and uniqueness as creation — a phone edited to a
+    // raw local form here would silently stop working as a sign-in.
+    let normalizedPhone: string | undefined;
+    if (data.phone !== undefined) {
+      const p = normalizeUgPhone(data.phone);
+      if (!p) {
+        next(createAppError(422, 'INVALID_PHONE', 'Enter a valid Ugandan mobile number'));
+        return;
+      }
+      const taken = await pool.query(
+        'SELECT id FROM staff_users WHERE phone = $1 AND id <> $2 LIMIT 1',
+        [p, id]
+      );
+      if (taken.rows.length > 0) {
+        next(createAppError(409, 'PHONE_TAKEN', 'Another staff member already uses this number'));
+        return;
+      }
+      normalizedPhone = p;
+    }
+
     // Validate role/branch combo
     if (data.role === 'orgadmin' && data.branch_id) {
       next(createAppError(400, 'VALIDATION_ERROR', 'Orgadmin cannot have a branch_id'));
@@ -241,7 +268,7 @@ router.patch('/:id', requireRole('orgadmin', 'manager'), async (req: Request, re
 
     if (data.full_name) { updates.push(`full_name = $${paramIndex++}`); values.push(data.full_name); }
     if (data.email !== undefined) { updates.push(`email = $${paramIndex++}`); values.push(data.email); }
-    if (data.phone !== undefined) { updates.push(`phone = $${paramIndex++}`); values.push(data.phone); }
+    if (normalizedPhone !== undefined) { updates.push(`phone = $${paramIndex++}`); values.push(normalizedPhone); }
     if (data.role) { updates.push(`role = $${paramIndex++}`); values.push(data.role); }
     if (data.branch_id !== undefined) { updates.push(`branch_id = $${paramIndex++}`); values.push(data.branch_id); }
 

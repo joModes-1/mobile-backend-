@@ -332,3 +332,228 @@ Different paths, near-identical logic. Worth consolidating.
 
 `GET /platform/audit`, in the spec's §4.2 table. There is no such route. The
 only audit endpoint is the org-scoped `GET /api/v1/audit-logs`.
+
+---
+
+# September 2026 — phone sign-in, commission, and what it broke
+
+Everything above this line predates a run of changes made on 20–21 September
+2026. Where the two disagree, this section is the later word.
+
+## Sign-in is now phone + one-time code, for every role
+
+This is the second complete reversal of the auth design, and it lands on the
+opposite side of the first one.
+
+The spec wanted clients on phone + SMS OTP and staff on username + password.
+Migration `20260829_006` abandoned the phone half and moved clients to
+username + email. That is the state described further up this file.
+
+Now the reverse: **`POST /auth/phone/start` and `/auth/phone/verify` are the
+only sign-in the mobile app offers, for clients, staff and platform admins
+alike.** One number, one code, no passwords anywhere in the UI.
+
+`phoneAuth.ts` resolves a number in priority order — `platform_admins`, then
+`staff_users`, then `clients` — because the same number must not mean two
+people and the more privileged account should win if it ever did. A number
+nobody recognises creates a new **client** account, and that is the only case
+that asks for a name.
+
+The password routes (`/auth/staff/login`, `/auth/client/login`,
+`/auth/platform/login`, all three `change-password`) still exist and still
+work. Nothing in the app calls them. They were left mounted deliberately, as
+an out-of-band way in if the SMS gateway is down.
+
+Consequences worth knowing:
+
+- **The app has no login screen.** `LoginScreen`, `ForgotPasswordScreen`,
+  `ChangePasswordScreen` and `AuthShell` were deleted, along with
+  `login` / `changePassword` / `mustChangePassword` on the auth context. The
+  `must_change_password` gate in `App.tsx` is gone — a passwordless account
+  would otherwise have been routed to a change-password screen with nothing
+  to type.
+- **SMS is now load-bearing.** `AFRICASTALKING` / `AFRICASTALKING_USERNAME`
+  are `.optional()` in config, so the server boots without them, `sendSms`
+  logs a warning and returns `{sent:false}`, and `/auth/phone/start` still
+  answers `200 ok`. A deployment missing those two variables accepts a phone
+  number, reports success, and sends nothing. Neither `.env.example` nor
+  `render.yaml` lists them. `TEST_MODE=true` returns the code in the response
+  body and is the only reason local testing works.
+- **Staff creation no longer issues a password or sends email.** See below.
+
+## Constraints that later migrations relaxed
+
+Three places where a later migration reversed an earlier decision. None are in
+the phase docs, and each is invisible unless you read the migrations in order.
+
+| Original | Reversed by | Why |
+|---|---|---|
+| `clients.phone NOT NULL` (001) | 006 drops it | username/email auth meant a client need not have a phone |
+| `services` / `vehicle_classes` single unique-name index + `one_default_service_per_org` (002) | 009 drops both, replaces with four partial indexes | branch-scoped catalogue |
+| `staff_users.password_hash NOT NULL` (001) | 014 drops it | phone-only staff have no password |
+
+Migration 014 also added `staff_users_phone_uniq`, a partial unique index on
+`phone WHERE phone IS NOT NULL`. **001 had no uniqueness on staff phone at
+all.** Before this, two staff rows could share a number and phone sign-in
+would resolve whichever one Postgres happened to return first. The same
+migration normalised existing phones to E.164 — one seeded worker was stored
+as `0709011288`, which sign-in could never have matched, because it normalises
+input to `+256709011288` before looking it up.
+
+## Staff creation (supersedes phase-1 and spec §4.10)
+
+`POST /staff` now:
+
+- **requires `phone`**, normalises it to E.164, and rejects a duplicate with
+  `409 PHONE_TAKEN` — it is the sign-in identity, so an account without one
+  cannot be signed into at all
+- **generates no password** (`password_hash` is `NULL`) and **sends no email**
+- sets `must_change_password = false`, because there is nothing to change
+
+`PATCH /staff/:id` applies the same normalisation and uniqueness. It
+previously stored whatever string was submitted, which is how the
+`0709011288` row above came to exist.
+
+The spec's staff password-reset ladder (§4.10) still exists as code —
+`POST /staff/:id/reset-password` — but the app no longer exposes it, and for
+an account created since this change there is no password for it to reset. It
+would create one.
+
+**Not converted:** the sysadmin screens that create organisations and platform
+admins still generate temp passwords. Those accounts can only sign in if their
+phone number happens to be on file.
+
+## Worker commission (undocumented anywhere else)
+
+Migration 015. A worker keeps a percentage of the cash they collect.
+
+- `branches.worker_commission_bp` — the rate, per branch, in basis points
+  (250 = 2.5%), `CHECK` between 0 and 10000. Basis points rather than a float
+  because a split done in binary floating point eventually disagrees with
+  itself by a shilling, and cash reconciliation is exactly where that gets
+  noticed. Set through `PATCH /branches/:id` as `worker_commission_pct`,
+  converted on the way in.
+- `washes.worker_commission_ugx` — what the worker actually earned on that
+  wash, **computed and frozen at settlement**, never derived from the branch
+  rate at read time. The rate changes; last month's report must still show
+  what was owed last month.
+
+Cash only. A mobile-money or free wash earns nothing, because the worker never
+holds that money. Rounded **down** — rounding up would have them keeping a
+shilling the till never received.
+
+The consequence that matters: **`computeExpectedCash` now returns
+`amount_ugx - worker_commission_ugx`.** The worker keeps their cut out of the
+notes in their hand, so the till was never going to receive it. Summing the
+gross would make every handover look short by exactly the commission, and the
+variance report would flag honest workers as light. The `GET /shifts` list
+query nets it the same way and additionally exposes `worker_commission_ugx`
+per shift.
+
+`/reports/daily` gained `worker_commission_ugx` and `net_ugx` alongside the
+untouched `gross_ugx`.
+
+`GET /washes/mine/earnings` is new: today / this week / this month totals,
+fourteen daily buckets, and the last twenty washes with their individual cuts.
+Attribution is to `settled_by_worker_id` — whoever took the money earned the
+cut, which is also whoever is holding the cash it came out of. On a handover
+that is deliberately the settling worker, not the starter.
+
+## Account deletion (required by both app stores)
+
+`POST /auth/client/delete-account`. Apple guideline 5.1.1(v) and Google Play
+both require an in-app way to delete an account for any app that lets people
+create one; a support email is not enough.
+
+It **anonymises rather than hard-deletes**. `washes.client_id` and
+`loyalty_ledger.client_id` have no `ON DELETE CASCADE`, deliberately — wash and
+loyalty history is the organisation's operational record, not only the
+customer's. A real `DELETE` would either fail on the foreign key or, if
+cascaded, destroy an org's history because one customer asked to leave.
+Instead every identifying column is scrubbed, `status` becomes `'deleted'`,
+and the row stays so the history pointing at it stays.
+
+Setting `phone = NULL` has a useful side effect: the number becomes invisible
+to phone sign-in and free for reuse, so a later signup on it correctly creates
+a fresh account rather than resurrecting the old one.
+
+## Notification events (supersedes phase-7)
+
+`notify()` takes four arguments, not the three the phase doc shows:
+`(recipientType, recipientId, event, payload)`.
+
+Two events were added in September: **`stale_wash`** and **`daily_summary`**.
+Both existed before as calls to `wash_started` with their text smuggled
+through that template's `service_name` slot, which meant a manager's phone
+read *"Wash Started — Your Daily Summary wash (…) is in progress. Quoted: UGX
+0"*. They are their own events now, so the copy can say what it means and an
+edit to the customer-facing wash copy cannot silently rewrite an operational
+alert.
+
+While fixing that: `nightlySummary` referenced `$2` while passing a single
+parameter, so Postgres rejected the query with *"could not determine data type
+of parameter $1"* on every run. The job's own `try/catch` swallowed it.
+**It had never once sent a summary.** Now `$1` throughout.
+
+## Tests
+
+`package.json` pointed `npm test` at jest. There is no jest config, and the
+seven scripts in `tests/` are standalone `ts-node` programs that drive the HTTP
+API — so `jest --listTests` found nothing and `npm test` passed while running
+zero tests. There are now `test:phase2` … `test:phase7`, `test:e2e` and
+`test:all` scripts that invoke them properly, and `phase2-test.ts` exits
+non-zero on failure like the rest.
+
+They need a **pristine database**: several change the credentials they
+authenticate with (`phase3-test.ts` changes the orgadmin password during
+setup), and the seeder is idempotent, so re-seeding does not put the original
+back. See `tests/README.md`. They also still sign in with username and
+password, so they exercise a path no real user takes — **the phone flow has no
+automated coverage at all.**
+
+## Still open
+
+- `GET /shifts/:id` returns `washes: []` unconditionally
+  (`shiftRoutes.ts:456`, "Washes will be added in Phase 4"). Phase 4 shipped
+  long ago. Dormant only because nothing calls the endpoint.
+- ~~Loyalty adjustment is defined twice.~~ **Fixed.** The duplicate in
+  `exceptionRoutes.ts` has been deleted. It was mounted under `/washes`, so
+  it answered at `/washes/:id/loyalty/adjust` while reading `:id` as a
+  **client** id: passing a real wash id returned `500` with Postgres `23503`
+  as it tried to create a loyalty account for a non-existent client, and
+  passing a genuine client id would have succeeded and mutated balances
+  through a path nothing was meant to use. It rolled back cleanly either
+  way, so nothing was ever corrupted.
+
+  The surviving implementation is `app.ts:95` at
+  `/clients/:id/loyalty/adjust` — the one the app calls. Verified after
+  removal: the orphan now 404s, and the real route still returns 200, moves
+  the balance, and writes a `manual_adjust` row to `loyalty_ledger`.
+
+  (An earlier draft of this document claimed the live route wrote no ledger
+  entry. That was wrong — it calls `writeLedgerEntry` at `app.ts:127`. The
+  ledger simply had no `manual_adjust` rows because the feature had never
+  been used.)
+- Around twenty endpoints are no longer called by the app, mostly the password
+  routes orphaned by phone sign-in. They were probed rather than assumed
+  harmless:
+
+  - `POST /auth/staff/login` and `/auth/staff/change-password` called
+    `argon2.verify()` on a `password_hash` that is now `NULL` for phone-only
+    staff. argon2 throws on a null hash rather than returning true — so this
+    was **never an authentication bypass** — but the exception escaped the
+    handler and a failed login returned **500** instead of 401. Both now
+    reject with `NO_PASSWORD_SET` before reaching argon2. Verified by
+    creating a passwordless staff row and logging in against it: 500 before,
+    401 after.
+  - `platform_admins.password_hash` is still `NOT NULL`, so the platform
+    login has no equivalent exposure. `clientAuth` already guarded it.
+  - `POST /staff/:id/reset-password` is harmless — it *writes* a hash rather
+    than verifying one. It would hand a phone-only account a password it has
+    no use for, but it cannot error.
+- Shifts auto-open (client-side, on the worker's home screen) but never
+  auto-close. A shift and its running cash total continue indefinitely until a
+  manager closes it on Cash Handover. This is deliberate: closing a shift *is*
+  the act of counting the cash, and a scheduled job has nobody to count it —
+  auto-closing with `counted = expected` would make variance always zero and
+  silently disable the only check on missing cash.

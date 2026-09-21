@@ -13,8 +13,14 @@ const router = Router();
 // ─── helpers ──────────────────────────────────────────────────
 
 async function getOpenShift(pool: any, workerId: string, branchId: string): Promise<any | null> {
+  // The branch's commission rate rides along: settlement freezes the
+  // worker's cut onto the wash, and reading it here avoids a second query
+  // inside the settle transaction.
   const r = await pool.query(
-    `SELECT id FROM shifts WHERE worker_id = $1 AND branch_id = $2 AND status = 'open'`,
+    `SELECT s.id, b.worker_commission_bp
+       FROM shifts s
+       JOIN branches b ON b.id = s.branch_id
+      WHERE s.worker_id = $1 AND s.branch_id = $2 AND s.status = 'open'`,
     [workerId, branchId]
   );
   return r.rows.length > 0 ? r.rows[0] : null;
@@ -669,6 +675,21 @@ async function settleWash(
     // 6. Settle
     const amountUgx = wash.is_redemption ? 0 : Number(wash.quoted_amount_ugx);
     const settleVerified = opts.payTokenConsumed;
+    const paymentMethod = wash.is_redemption ? 'free' : (opts.paymentMethod || 'cash');
+
+    // Worker commission, frozen onto the row at settlement.
+    //
+    // Cash only: the worker keeps their cut out of the notes in their hand,
+    // so there is nothing to keep out of a mobile-money payment that went
+    // straight to the business, or a free wash where no money moved.
+    // Rounded down to the shilling — rounding up would have the worker
+    // keeping a shilling the till never received, which is exactly the kind
+    // of one-unit drift that makes a handover look short.
+    const commissionBp = Number(shift.worker_commission_bp || 0);
+    const commissionUgx =
+      paymentMethod === 'cash' && commissionBp > 0
+        ? Math.floor((amountUgx * commissionBp) / 10000)
+        : 0;
 
     await client.query(
       `UPDATE washes SET
@@ -684,6 +705,7 @@ async function settleWash(
         payment_method = $8,
         payer_phone = $9,
         payment_ref = $10,
+        worker_commission_ugx = $12,
         updated_at = now()
        WHERE id = $11`,
       [
@@ -696,10 +718,11 @@ async function settleWash(
         opts.handoverNote || null,
         // A free wash is its own method: no money moved, so it should not
         // be counted as cash the worker is holding.
-        wash.is_redemption ? 'free' : (opts.paymentMethod || 'cash'),
+        paymentMethod,
         opts.payerPhone || null,
         opts.paymentRef || null,
         washId,
+        commissionUgx,
       ]
     );
 
@@ -1205,6 +1228,103 @@ router.get('/', requireRole('orgadmin', 'manager', 'worker'), async (req: Reques
 
     const result = await pool.query(query, params);
     res.json({ ok: true, data: result.rows });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── GET /washes/mine/earnings — what the worker has earned ──
+
+/**
+ * The worker's own commission earnings, today / this week / this month,
+ * plus a recent breakdown.
+ *
+ * Reads `worker_commission_ugx` off each wash rather than recomputing from
+ * the branch's current rate: the rate can change, and a worker looking at
+ * last week must see what they actually earned then, not what this week's
+ * rate would have paid.
+ *
+ * Attributed to `settled_by_worker_id` — whoever took the money earned the
+ * cut, which is also who was holding the cash it came out of. On a
+ * handover that is deliberately the settling worker, not the one who
+ * started the car.
+ */
+router.get('/mine/earnings', requireRole('orgadmin', 'manager', 'worker'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const pool = getPool();
+    const workerId = req.actor!.sub;
+
+    const totals = await pool.query(
+      `SELECT
+         COALESCE(SUM(worker_commission_ugx) FILTER (
+           WHERE settled_at::date = CURRENT_DATE), 0) AS today_ugx,
+         COUNT(*) FILTER (
+           WHERE settled_at::date = CURRENT_DATE) AS today_washes,
+         -- date_trunc('week') is Monday-based in Postgres, which matches
+         -- how a shift week is actually talked about on the forecourt.
+         COALESCE(SUM(worker_commission_ugx) FILTER (
+           WHERE settled_at >= date_trunc('week', CURRENT_DATE)), 0) AS week_ugx,
+         COUNT(*) FILTER (
+           WHERE settled_at >= date_trunc('week', CURRENT_DATE)) AS week_washes,
+         COALESCE(SUM(worker_commission_ugx) FILTER (
+           WHERE settled_at >= date_trunc('month', CURRENT_DATE)), 0) AS month_ugx,
+         COUNT(*) FILTER (
+           WHERE settled_at >= date_trunc('month', CURRENT_DATE)) AS month_washes
+       FROM washes
+       WHERE settled_by_worker_id = $1 AND status = 'settled'`,
+      [workerId]
+    );
+
+    // Per-day for the last 14 days, for a small trend on the earnings page.
+    const daily = await pool.query(
+      `SELECT settled_at::date AS day,
+              COALESCE(SUM(worker_commission_ugx), 0) AS earned_ugx,
+              COUNT(*) AS washes
+         FROM washes
+        WHERE settled_by_worker_id = $1 AND status = 'settled'
+          AND settled_at >= CURRENT_DATE - INTERVAL '13 days'
+        GROUP BY settled_at::date
+        ORDER BY day`,
+      [workerId]
+    );
+
+    // The individual washes behind today's figure, so a worker can check
+    // the number against cars they remember rather than trust a total.
+    const recent = await pool.query(
+      `SELECT w.id, w.job_no, w.amount_ugx, w.worker_commission_ugx,
+              w.payment_method, w.settled_at,
+              vc.name AS vehicle_class_name, s.name AS service_name
+         FROM washes w
+         LEFT JOIN vehicle_classes vc ON vc.id = w.vehicle_class_id
+         LEFT JOIN services s ON s.id = w.service_id
+        WHERE w.settled_by_worker_id = $1 AND w.status = 'settled'
+        ORDER BY w.settled_at DESC
+        LIMIT 20`,
+      [workerId]
+    );
+
+    // The rate in force right now, so the page can explain the figures.
+    const rate = await pool.query(
+      `SELECT worker_commission_bp FROM branches WHERE id = $1`,
+      [req.actor!.branch_id]
+    );
+
+    const t = totals.rows[0];
+    res.json({
+      ok: true,
+      data: {
+        commission_pct: Number(rate.rows[0]?.worker_commission_bp || 0) / 100,
+        today: { earned_ugx: Number(t.today_ugx), washes: Number(t.today_washes) },
+        week: { earned_ugx: Number(t.week_ugx), washes: Number(t.week_washes) },
+        month: { earned_ugx: Number(t.month_ugx), washes: Number(t.month_washes) },
+        daily: daily.rows.map((r: any) => ({
+          day: r.day,
+          earned_ugx: Number(r.earned_ugx),
+          washes: Number(r.washes),
+        })),
+        recent: recent.rows,
+      },
+    });
   } catch (err) {
     next(err);
   }

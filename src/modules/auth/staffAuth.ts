@@ -81,6 +81,18 @@ router.post('/login', async (req: Request, res: Response, next: NextFunction) =>
       return;
     }
 
+    // Staff created since phone sign-in have `password_hash = NULL`. argon2
+    // throws "pchstr must be a non-empty string" on a null hash, which
+    // surfaced as a 500 on what is really just a failed login — so this is
+    // an explicit rejection rather than an exception escaping the handler.
+    // It is not a bypass either way: verify() throws rather than returning
+    // true, but a 500 on a login attempt reads like the server is down.
+    if (!staff.password_hash) {
+      recordFailedLogin(lockId);
+      next(createAppError(401, 'NO_PASSWORD_SET', 'This account signs in by phone. Use the code sent to your number.'));
+      return;
+    }
+
     // Verify password
     const valid = await argon2.verify(staff.password_hash, password);
     if (!valid) {
@@ -164,6 +176,13 @@ router.post('/change-password', authenticate, async (req: Request, res: Response
 
     if (result.rows.length === 0) {
       next(createAppError(404, 'NOT_FOUND', 'Staff not found'));
+      return;
+    }
+
+    // Same null-hash hazard as the login route above: a phone-only staff
+    // member has no current password to verify against.
+    if (!result.rows[0].password_hash) {
+      next(createAppError(400, 'NO_PASSWORD_SET', 'This account has no password. It signs in by phone.'));
       return;
     }
 

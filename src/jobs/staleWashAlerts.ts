@@ -31,12 +31,11 @@ export async function runStaleWashAlerts(): Promise<void> {
       );
 
       for (const mgr of mgrResult.rows) {
-        await notify('staff', mgr.id, 'wash_started', {
+        await notify('staff', mgr.id, 'stale_wash', {
           wash_id: wash.id,
-          vehicle_class: 'Ready wash',
-          service_name: `Job ${wash.job_no} has been ready for over ${wash.ready_alert_minutes} minutes`,
+          job_no: wash.job_no,
+          minutes: wash.ready_alert_minutes,
           branch_name: wash.branch_name,
-          amount_ugx: 0,
         });
       }
 

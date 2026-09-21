@@ -7,12 +7,21 @@ import { requireRole, getOrgId } from '@/middleware/requireRole';
 const router = Router();
 
 /**
- * computeExpectedCash — stub for now, Phase 4 wires this to washes table.
- * Returns the sum of settled washes' amounts on this shift.
+ * What the worker should be holding, and therefore hand over.
+ *
+ * Net of their own commission: the worker keeps their cut out of the cash
+ * they collected, so the till was never going to receive it. Counting the
+ * gross here would make every single handover look short by exactly the
+ * commission, and the variance report would flag honest workers as light.
+ *
+ * Only cash rows carry a commission (see settlement), so summing the
+ * column unconditionally is safe — mobile-money and free washes contribute
+ * 0 to it.
  */
 async function computeExpectedCash(pool: any, shiftId: string): Promise<number> {
   const r = await pool.query(
-    `SELECT COALESCE(SUM(amount_ugx), 0) as total FROM washes WHERE settled_shift_id = $1 AND status = 'settled'`,
+    `SELECT COALESCE(SUM(amount_ugx - worker_commission_ugx), 0) as total
+       FROM washes WHERE settled_shift_id = $1 AND status = 'settled'`,
     [shiftId]
   );
   return Number(r.rows[0].total);
@@ -88,7 +97,8 @@ router.get('/current', requireRole('orgadmin', 'manager', 'worker'), async (req:
 
     const shift = result.rows[0];
 
-    // Compute live totals (stub: returns 0 until Phase 4)
+    // Live, not the stored column: an open shift's stored value is still 0
+    // until it closes, and the worker needs to know what they are carrying.
     const expectedCash = await computeExpectedCash(pool, shift.id);
 
     res.json({
@@ -320,9 +330,15 @@ router.get('/', requireRole('orgadmin', 'manager'), async (req: Request, res: Re
     let query = `
       SELECT s.*, su.full_name as worker_name, b.name as branch_name,
         COALESCE((
-          SELECT SUM(w.amount_ugx) FROM washes w
+          -- Net of commission, for the same reason computeExpectedCash is:
+          -- this is what the manager should actually collect.
+          SELECT SUM(w.amount_ugx - w.worker_commission_ugx) FROM washes w
           WHERE w.settled_shift_id = s.id AND w.status = 'settled'
         ), 0) AS live_expected_cash_ugx,
+        COALESCE((
+          SELECT SUM(w.worker_commission_ugx) FROM washes w
+          WHERE w.settled_shift_id = s.id AND w.status = 'settled'
+        ), 0) AS worker_commission_ugx,
         COALESCE((
           SELECT COUNT(*) FROM washes w
           WHERE w.settled_shift_id = s.id AND w.status = 'settled'
@@ -404,7 +420,7 @@ router.get('/', requireRole('orgadmin', 'manager'), async (req: Request, res: Re
 
 /**
  * GET /shifts/:id
- * Shift detail (includes settled wash list — Phase 4)
+ * Shift detail, including the washes settled against it.
  */
 router.get('/:id', requireRole('orgadmin', 'manager'), async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -434,9 +450,28 @@ router.get('/:id', requireRole('orgadmin', 'manager'), async (req: Request, res:
       return;
     }
 
-    // Washes will be added in Phase 4
     const shift = result.rows[0];
-    shift.washes = [];
+
+    // This returned a hardcoded empty array with a "Phase 4 will add this"
+    // comment long after Phase 4 shipped, so a shift's detail view claimed
+    // every shift had washed nothing.
+    const washes = await pool.query(
+      `SELECT w.id, w.job_no, w.receipt_no, w.status, w.amount_ugx,
+              w.worker_commission_ugx, w.payment_method, w.is_redemption,
+              w.started_at, w.settled_at,
+              vc.name AS vehicle_class_name, s.name AS service_name,
+              starter.full_name AS started_by_name,
+              settler.full_name AS settled_by_name
+         FROM washes w
+         LEFT JOIN vehicle_classes vc ON vc.id = w.vehicle_class_id
+         LEFT JOIN services s ON s.id = w.service_id
+         LEFT JOIN staff_users starter ON starter.id = w.started_by_worker_id
+         LEFT JOIN staff_users settler ON settler.id = w.settled_by_worker_id
+        WHERE w.settled_shift_id = $1
+        ORDER BY w.settled_at DESC NULLS LAST, w.started_at DESC`,
+      [id]
+    );
+    shift.washes = washes.rows;
 
     res.json({ ok: true, data: shift });
   } catch (err) {

@@ -14,26 +14,28 @@ export async function runNightlySummary(): Promise<void> {
     const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
 
     // Get managers with their branch summaries
+    // Every placeholder is $1: this referenced $2 while passing a single
+    // parameter, so Postgres rejected it with "could not determine data type
+    // of parameter $1" on every run — the job has never actually sent a
+    // summary. The catch below swallowed it, so it failed silently.
     const managers = await pool.query(`
-      SELECT su.id as manager_id, su.full_name, b.name as branch_name,
-             (SELECT COUNT(*) FROM washes WHERE branch_id = b.id AND status = 'settled' AND started_at::date = $2) AS washes,
-             (SELECT COALESCE(SUM(amount_ugx), 0) FROM washes WHERE branch_id = b.id AND status = 'settled' AND started_at::date = $2) AS gross,
-             (SELECT COALESCE(SUM(ABS(variance_ugx)), 0) FROM shifts WHERE branch_id = b.id AND status = 'closed' AND opened_at::date = $2) AS variance
+      SELECT su.id as manager_id, su.full_name, b.id as branch_id, b.name as branch_name,
+             (SELECT COUNT(*) FROM washes WHERE branch_id = b.id AND status = 'settled' AND started_at::date = $1) AS washes,
+             (SELECT COALESCE(SUM(amount_ugx), 0) FROM washes WHERE branch_id = b.id AND status = 'settled' AND started_at::date = $1) AS gross,
+             (SELECT COALESCE(SUM(ABS(variance_ugx)), 0) FROM shifts WHERE branch_id = b.id AND status = 'closed' AND opened_at::date = $1) AS variance
       FROM staff_users su
       JOIN branches b ON su.branch_id = b.id
       WHERE su.role = 'manager' AND su.status = 'active'
     `, [yesterday]);
 
     for (const mgr of managers.rows) {
-      const message = `📊 ${mgr.branch_name} — ${yesterday}\n` +
-        `Washes: ${mgr.washes} | Gross: UGX ${Number(mgr.gross).toLocaleString()} | Variance: UGX ${Number(mgr.variance).toLocaleString()}`;
-
-      await notify('staff', mgr.manager_id, 'wash_started', {
-        wash_id: '',
-        vehicle_class: 'Daily Summary',
-        service_name: message,
+      await notify('staff', mgr.manager_id, 'daily_summary', {
+        date: yesterday,
+        branch_id: mgr.branch_id,
         branch_name: mgr.branch_name,
-        amount_ugx: 0,
+        washes: Number(mgr.washes),
+        gross_ugx: Number(mgr.gross),
+        variance_ugx: Number(mgr.variance),
       });
     }
 
