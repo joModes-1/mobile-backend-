@@ -47,8 +47,16 @@ router.get('/', authenticate, async (req: Request, res: Response, next: NextFunc
       }
       res.json({ ok: true, data: result.rows[0] });
     } else if (actor.type === 'client') {
+      // org_id/org_name were missing here — harmless while a client's own
+      // screens never needed to know their org, but the branch-QR resolve
+      // call needs it (a QR encodes org_id + branch code together, since
+      // code is only unique per org) and had nothing to read it from.
       const result = await pool.query(
-        'SELECT id, full_name, username, email, email_verified, member_code, status FROM clients WHERE id = $1',
+        `SELECT c.id, c.full_name, c.username, c.email, c.email_verified, c.member_code, c.status,
+                c.org_id, o.name as org_name
+           FROM clients c
+           JOIN organizations o ON c.org_id = o.id
+          WHERE c.id = $1`,
         [actor.sub]
       );
       if (result.rows.length === 0) {

@@ -6,6 +6,7 @@ import { getPool } from '@/db';
 import { signAccessToken, signRefreshToken } from '@/utils/jwt';
 import { createAppError } from '@/middleware/errorHandler';
 import { sendOtpSms, normalizeUgPhone, displayUgPhone } from '@/utils/sms';
+import { lookupNameByPhone } from '@/utils/nameLookup';
 import { getEnv } from '@/config';
 
 const router = Router();
@@ -62,7 +63,7 @@ function checkOtpRateLimit(phone: string): void {
 
 function generateOtp(): string {
   let code = '';
-  for (let i = 0; i < 6; i++) code += Math.floor(Math.random() * 10).toString();
+  for (let i = 0; i < 4; i++) code += Math.floor(Math.random() * 10).toString();
   return code;
 }
 
@@ -151,7 +152,7 @@ router.post('/start', async (req: Request, res: Response, next: NextFunction) =>
 
 const verifySchema = z.object({
   phone: z.string().min(9).max(20),
-  code: z.string().length(6),
+  code: z.string().length(4),
   // Only used when the number is genuinely new — an existing account of
   // any kind already has a name and this is ignored for it.
   full_name: z.string().min(1).max(120).optional(),
@@ -315,13 +316,20 @@ router.post('/verify', async (req: Request, res: Response, next: NextFunction) =
       const orgId = orgResult.rows[0].id;
       const local = phone.replace('+256', '0');
 
+      // The client's own app no longer asks for a name at sign-up — this is
+      // the only chance to get one before 'Customer' sticks until they set
+      // it themselves in Profile. lookupNameByPhone is a no-op returning
+      // null until a provider is configured (see its own doc comment); this
+      // stays exactly as safe as sign-up already was in that case.
+      const resolvedName = data.full_name?.trim() || (await lookupNameByPhone(phone));
+
       row = (await conn.query(
         `INSERT INTO clients
            (org_id, full_name, phone, member_code, phone_verified,
             username, email, email_verified, password_hash)
          VALUES ($1, $2, $3, $4, true, $5, $6, false, NULL)
          RETURNING id, org_id, full_name, member_code`,
-        [orgId, data.full_name?.trim() || 'Customer', phone,
+        [orgId, resolvedName || 'Customer', phone,
          generateMemberCode(), `u${local}`, `${local}@phone.local`]
       )).rows[0];
     } else {

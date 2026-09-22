@@ -122,6 +122,19 @@ export async function notify(
       })));
       break;
 
+    case 'wash_requested':
+      // Fanned out by the caller to every worker with an open shift at the
+      // branch — nobody is attached to the wash yet, so there is no single
+      // "the worker" to notify. See POST /me/washes in clientWashRoutes.ts.
+      messages.push(...tokens.map((to) => ({
+        to,
+        title: 'New wash request',
+        body: `${payload.vehicle_class_name || 'A car'} — ${payload.service_name || 'wash'} is waiting to be accepted.`,
+        data: { event, wash_id: payload.wash_id, job_no: payload.job_no },
+        sound: 'default',
+      })));
+      break;
+
     case 'wash_reversed':
       messages.push(...tokens.map((to) => ({
         to,

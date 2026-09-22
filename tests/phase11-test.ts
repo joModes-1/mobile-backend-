@@ -138,7 +138,11 @@ async function main() {
     }
     check('client number resolves as client', s.body?.data?.role === 'client', 'got ' + s.body?.data?.role);
     const code = s.body?.data?.otp_code;
-    const wrong = await call('POST', '/auth/phone/verify', { phone, code: code === '000000' ? '111111' : '000000' });
+    // A same-length code that just isn't the right one — otherwise a
+    // hardcoded literal of the wrong digit count gets rejected by the zod
+    // schema instead of by the actual wrong-code check this test wants.
+    const wrongCode = code.split('').map((d: string) => (d === '9' ? '0' : '9')).join('');
+    const wrong = await call('POST', '/auth/phone/verify', { phone, code: wrongCode });
     check('wrong code rejected', wrong.status >= 400, 'status ' + wrong.status);
 
     const good = await call('POST', '/auth/phone/verify', { phone, code });

@@ -26,7 +26,7 @@ async function getOpenShift(pool: any, workerId: string, branchId: string): Prom
   return r.rows.length > 0 ? r.rows[0] : null;
 }
 
-async function bumpJobNo(pool: any, branchId: string, branchCode: string): Promise<string> {
+export async function bumpJobNo(pool: any, branchId: string, branchCode: string): Promise<string> {
   const r = await pool.query(
     `INSERT INTO branch_counters (branch_id, day, last_job_seq)
      VALUES ($1, CURRENT_DATE, 1)
@@ -382,9 +382,123 @@ router.get('/queue', requireRole('orgadmin', 'manager', 'worker'), async (req: R
       stale: (parseFloat(r.elapsed_minutes) || 0) > readyAlertMin,
     }));
 
-    res.json({ ok: true, data: { washing, ready } });
+    // Requested: client bookings nobody has accepted yet. Every worker at
+    // the branch sees the whole list regardless of their own busy state —
+    // only the accept endpoint itself gates who can actually claim one — so
+    // this is a LEFT JOIN, not the INNER JOIN washing/ready use above:
+    // started_by_worker_id is NULL here by definition, and an INNER JOIN
+    // against it would silently return zero rows.
+    const requestedResult = await pool.query(
+      `SELECT w.id, w.job_no, w.plate, w.vehicle_color, w.quoted_amount_ugx,
+              w.requested_at, w.is_redemption, w.declared_payment_method,
+              vc.name as vehicle_class_name, s.name as service_name,
+              c.full_name as client_name,
+              EXTRACT(EPOCH FROM (now() - w.requested_at)) / 60 as elapsed_minutes
+       FROM washes w
+       JOIN vehicle_classes vc ON w.vehicle_class_id = vc.id
+       JOIN services s ON w.service_id = s.id
+       LEFT JOIN clients c ON w.client_id = c.id
+       WHERE w.branch_id = $1 AND w.status = 'requested' AND w.started_by_worker_id IS NULL
+       ORDER BY w.requested_at ASC`,
+      [branchId]
+    );
+    const requested = requestedResult.rows.map((r) => ({
+      ...r,
+      elapsed_minutes: Math.round(parseFloat(r.elapsed_minutes) || 0),
+    }));
+
+    res.json({ ok: true, data: { washing, ready, requested } });
   } catch (err) {
     next(err);
+  }
+});
+
+// ─── POST /washes/:id/accept — Worker claims a client's request ──
+//
+// The client-booking counterpart of what used to be one act (a worker
+// scanning a customer and creating the wash themselves). A 'requested' wash
+// already exists with everything but a worker attached; accepting it is the
+// moment started_by_worker_id is set for the first time — after that, every
+// downstream function (wash-done, settle, handover) treats this wash
+// identically to one a worker started the old way.
+
+router.post('/:id/accept', requireRole('orgadmin', 'manager', 'worker'), async (req: Request, res: Response, next: NextFunction) => {
+  const pool = getPool();
+  const workerId = req.actor!.sub;
+  const branchId = req.actor!.branch_id;
+
+  if (!branchId) {
+    next(createAppError(400, 'NO_BRANCH', 'Staff must have a branch to accept a wash'));
+    return;
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const shift = await getOpenShift(client, workerId, branchId);
+    if (!shift) {
+      await client.query('ROLLBACK');
+      next(createAppError(409, 'NO_OPEN_SHIFT', 'You need an open shift to accept a wash'));
+      return;
+    }
+
+    // "Free" means zero washes this worker already has in progress — a
+    // query-time definition, not a schema constraint (nothing stops a
+    // worker starting several the old walk-in way). Checked here, not as a
+    // queue-visibility filter, so a busy worker still sees what's coming.
+    const busy = await client.query(
+      `SELECT COUNT(*) as cnt FROM washes WHERE started_by_worker_id = $1 AND status = 'in_progress'`,
+      [workerId]
+    );
+    if (parseInt(busy.rows[0].cnt) > 0) {
+      await client.query('ROLLBACK');
+      next(createAppError(409, 'WORKER_BUSY', 'Finish your current car before accepting another'));
+      return;
+    }
+
+    // Atomic claim — race-safe the same way consumeToken() is: two workers
+    // accepting the same request at once, exactly one UPDATE matches.
+    const claimed = await client.query(
+      `UPDATE washes
+          SET status = 'in_progress', started_by_worker_id = $1, started_shift_id = $2,
+              started_at = now(), updated_at = now()
+        WHERE id = $3 AND branch_id = $4
+          AND status = 'requested' AND started_by_worker_id IS NULL
+        RETURNING id, job_no, client_id`,
+      [workerId, shift.id, req.params.id, branchId]
+    );
+
+    if (claimed.rows.length === 0) {
+      await client.query('ROLLBACK');
+      const check = await pool.query(
+        `SELECT status, branch_id, started_by_worker_id FROM washes WHERE id = $1`,
+        [req.params.id]
+      );
+      if (check.rows.length === 0) {
+        next(createAppError(404, 'NOT_FOUND', 'Wash not found'));
+        return;
+      }
+      if (check.rows[0].branch_id !== branchId) {
+        next(createAppError(409, 'WRONG_BRANCH', 'This request belongs to a different branch'));
+        return;
+      }
+      next(createAppError(409, 'ALREADY_CLAIMED', 'Another worker already accepted this request'));
+      return;
+    }
+
+    await client.query('COMMIT');
+    const wash = claimed.rows[0];
+    // Reuses wash_started rather than adding a near-duplicate event: from
+    // the client's side, "a worker accepted" and "my wash started" are the
+    // same moment, and that copy already fits.
+    notify('client', wash.client_id || '', 'wash_started', { wash_id: wash.id, job_no: wash.job_no });
+    res.json({ ok: true, data: { id: wash.id, status: 'in_progress', job_no: wash.job_no } });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    next(err);
+  } finally {
+    client.release();
   }
 });
 
@@ -1130,6 +1244,9 @@ router.get('/:id', requireRole('orgadmin', 'manager', 'worker'), async (req: Req
     const pool = getPool();
     const { id } = req.params;
 
+    // started_by_worker_id is nullable now (a client-booked wash that
+    // nobody has accepted yet) — this must stay a LEFT JOIN, or a
+    // 'requested' wash silently returns zero rows here.
     const result = await pool.query(
       `SELECT w.*,
               vc.name as vehicle_class_name, svc.name as service_name,
@@ -1140,7 +1257,7 @@ router.get('/:id', requireRole('orgadmin', 'manager', 'worker'), async (req: Req
        FROM washes w
        JOIN vehicle_classes vc ON w.vehicle_class_id = vc.id
        JOIN services svc ON w.service_id = svc.id
-       JOIN staff_users sw ON w.started_by_worker_id = sw.id
+       LEFT JOIN staff_users sw ON w.started_by_worker_id = sw.id
        LEFT JOIN staff_users stw ON w.settled_by_worker_id = stw.id
        LEFT JOIN staff_users cb ON w.cancelled_by = cb.id
        LEFT JOIN clients c ON w.client_id = c.id
@@ -1166,6 +1283,8 @@ router.get('/', requireRole('orgadmin', 'manager', 'worker'), async (req: Reques
     const pool = getPool();
     const orgId = getOrgId(req.actor!);
 
+    // Same LEFT JOIN reasoning as GET /washes/:id above — a 'requested'
+    // wash has no started_by_worker_id yet.
     let query = `
       SELECT w.id, w.job_no, w.status, w.plate, w.quoted_amount_ugx, w.amount_ugx,
              w.is_redemption, w.started_at, w.wash_done_at, w.settled_at, w.receipt_no,
@@ -1176,7 +1295,7 @@ router.get('/', requireRole('orgadmin', 'manager', 'worker'), async (req: Reques
       FROM washes w
       JOIN vehicle_classes vc ON w.vehicle_class_id = vc.id
       JOIN services svc ON w.service_id = svc.id
-      JOIN staff_users sw ON w.started_by_worker_id = sw.id
+      LEFT JOIN staff_users sw ON w.started_by_worker_id = sw.id
       JOIN branches b ON w.branch_id = b.id
       LEFT JOIN staff_users stw ON w.settled_by_worker_id = stw.id
       LEFT JOIN clients c ON w.client_id = c.id

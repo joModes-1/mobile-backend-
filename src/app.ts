@@ -31,6 +31,7 @@ import priceRouter from '@/modules/pricing/priceRoutes';
 import shiftRouter from '@/modules/shifts/shiftRoutes';
 import workerPointsRouter from '@/modules/workerPoints/pointsRoutes';
 import deviceRouter from '@/modules/clients/deviceRoutes';
+import clientBranchRouter from '@/modules/branches/clientBranchRoutes';
 
 // Phase 4 routes
 import tokenRouter from '@/modules/tokens/tokenRoutes';
@@ -76,6 +77,7 @@ app.use('/api/v1/me', authenticate, requirePasswordChanged, meRouter);
 app.use('/api/v1/platform', authenticate, requirePasswordChanged, platformOrgRouter);
 app.use('/api/v1/staff', authenticate, requirePasswordChanged, staffRouter);
 app.use('/api/v1/branches', authenticate, requirePasswordChanged, branchRouter);
+app.use('/api/v1/me/branches', authenticate, requirePasswordChanged, clientBranchRouter);
 app.use('/api/v1', authenticate, requirePasswordChanged, catalogueRouter);
 app.use('/api/v1/prices', authenticate, requirePasswordChanged, priceRouter);
 app.use('/api/v1/shifts', authenticate, requirePasswordChanged, shiftRouter);
