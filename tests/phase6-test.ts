@@ -1,6 +1,7 @@
 import http from 'http';
 import dotenv from 'dotenv';
 import path from 'path';
+import { signInAs } from './helpers/auth';
 dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
 const BASE = 'http://localhost:3456';
@@ -36,27 +37,31 @@ async function test(name: string, fn: () => Promise<void>) {
 function assert(cond: boolean, msg: string) { if (!cond) throw new Error(msg); }
 
 async function main() {
-  // ── Setup: login with seed passwords, bypass must_change by using the token directly ──
-  let r = await req('POST', '/api/v1/auth/staff/login', undefined, { username: 'orgadmin', password: 'Orgadmin123!' });
-  assert(r.status === 200, 'orgadmin login ' + r.status + ' ' + JSON.stringify(r.body));
-  const OA = r.body.data.access_token;
+  // ── Setup: sign in via phone + OTP ──
+  // Staff passwords (and the must_change_password flow this setup used to work
+  // around) were removed from the platform; sign-in is phone + OTP now.
+  const OA = await signInAs('orgadmin');
+  const MG = await signInAs('grace');
+  const W1 = await signInAs('joseph');
 
-  r = await req('POST', '/api/v1/auth/staff/login', undefined, { username: 'grace', password: 'Manager123!' });
-  assert(r.status === 200, 'manager login ' + r.status);
-  const MG = r.body.data.access_token;
-
-  r = await req('POST', '/api/v1/auth/staff/login', undefined, { username: 'joseph', password: 'Worker123!' });
-  assert(r.status === 200, 'worker login ' + r.status);
-  const W1 = r.body.data.access_token;
+  let r: { status: number; body: any };
 
   // Get vehicle class
   r = await req('GET', '/api/v1/vehicle-classes', OA);
   assert(r.status === 200, 'list vc ' + r.status);
   const saloonId = r.body.data.find((v: any) => v.name === 'Saloon').id;
 
-  // Open shift for worker (ignore if already open)
+  // Open shift for worker (ignore if already open).
+  // The seed can leave the worker's last shift in 'pending_close', which blocks
+  // /shifts/open with 409 yet cannot take washes — reopen it in that case.
   r = await req('POST', '/api/v1/shifts/open', W1);
-  if (r.status !== 201 && r.status !== 409) { console.log('ERROR opening shift:', JSON.stringify(r.body)); process.exit(1); }
+  if (r.status === 409) {
+    const cur = await req('GET', '/api/v1/shifts/current', W1);
+    if (cur.status === 200 && cur.body.data?.status === 'pending_close') {
+      const re = await req('POST', `/api/v1/shifts/${cur.body.data.id}/reopen`, W1);
+      if (re.status !== 200) { console.log('ERROR reopening shift:', JSON.stringify(re.body)); process.exit(1); }
+    }
+  } else if (r.status !== 201) { console.log('ERROR opening shift:', JSON.stringify(r.body)); process.exit(1); }
 
   // Create some test data
   async function createSettledWash(): Promise<string> {

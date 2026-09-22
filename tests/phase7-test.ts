@@ -1,6 +1,7 @@
 import http from 'http';
 import dotenv from 'dotenv';
 import path from 'path';
+import { signInAs } from './helpers/auth';
 dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
 const BASE = 'http://localhost:3456';
@@ -38,31 +39,44 @@ function assert(cond: boolean, msg: string) { if (!cond) throw new Error(msg); }
 const Pool = require('pg').Pool;
 function getPool() { return new Pool({ connectionString: process.env.DATABASE_URL }); }
 
+/**
+ * Make sure `token`'s worker has an open shift before starting a wash.
+ *
+ * These suites run against a shared dev database, so a worker may arrive with
+ * a shift left open by an earlier run (409 SHIFT_ALREADY_OPEN — fine) or with
+ * none at all (201 — also fine). Anything else is a real failure and should
+ * say so here rather than surfacing later as a confusing NO_OPEN_SHIFT on the
+ * wash-start call.
+ */
+async function ensureOpenShift(token: string, who: string) {
+  const res = await req('POST', '/api/v1/shifts/open', token);
+  const alreadyOpen = res.status === 409 && res.body?.error?.code === 'SHIFT_ALREADY_OPEN';
+  assert(
+    res.status === 201 || alreadyOpen,
+    `could not open a shift for ${who}: ${res.status} ${JSON.stringify(res.body)}`
+  );
+}
+
 async function main() {
-  let r = await req('POST', '/api/v1/auth/staff/login', undefined, { username: 'orgadmin', password: 'Orgadmin123!' });
-  assert(r.status === 200, 'orgadmin login');
-  const OA = r.body.data.access_token;
+  // Sign in by phone + OTP. Staff passwords no longer exist, so the old
+  // `/auth/staff/login` calls are gone with them.
+  const OA = await signInAs('orgadmin');
+  const MG = await signInAs('grace');
+  const W1 = await signInAs('joseph');
 
-  r = await req('POST', '/api/v1/auth/staff/login', undefined, { username: 'grace', password: 'Manager123!' });
-  assert(r.status === 200, 'manager login');
-  const MG = r.body.data.access_token;
-
-  r = await req('POST', '/api/v1/auth/staff/login', undefined, { username: 'joseph', password: 'Worker123!' });
-  assert(r.status === 200, 'worker login');
-  const W1 = r.body.data.access_token;
-
-  r = await req('GET', '/api/v1/vehicle-classes', OA);
+  let r = await req('GET', '/api/v1/vehicle-classes', OA);
   const saloonId = r.body.data.find((v: any) => v.name === 'Saloon').id;
   const suvId = r.body.data.find((v: any) => v.name === 'SUV').id;
 
   // ═══ Device lifecycle ═══
 
-  await test('Login with push_token upserts device', async () => {
-    r = await req('POST', '/api/v1/auth/staff/login', undefined, {
-      username: 'joseph', password: 'Worker123!',
+  await test('Registering a push_token upserts device', async () => {
+    // Device registration moved off the (now removed) password login body and
+    // onto POST /me/device, which the signed-in user calls for themselves.
+    r = await req('POST', '/api/v1/me/device', W1, {
       push_token: 'ExponentPushToken[test-dev-1]', platform: 'android',
     });
-    assert(r.status === 200, 'login');
+    assert(r.status === 200, 'register device ' + r.status);
 
     const pool = getPool();
     const dev = await pool.query(`SELECT * FROM devices WHERE push_token = 'ExponentPushToken[test-dev-1]'`);
@@ -71,12 +85,11 @@ async function main() {
     await pool.end();
   });
 
-  await test('Login on another user\'s device reassigns it', async () => {
-    r = await req('POST', '/api/v1/auth/staff/login', undefined, {
-      username: 'grace', password: 'Manager123!',
+  await test('Registering another user\'s device reassigns it', async () => {
+    r = await req('POST', '/api/v1/me/device', MG, {
       push_token: 'ExponentPushToken[test-dev-1]', platform: 'android',
     });
-    assert(r.status === 200, 'grace login');
+    assert(r.status === 200, 'grace registers device ' + r.status);
 
     const pool = getPool();
     const dev = await pool.query(`SELECT owner_id FROM devices WHERE push_token = 'ExponentPushToken[test-dev-1]'`);
@@ -107,10 +120,7 @@ async function main() {
   // ═══ Notifications ═══
 
   await test('Settlement succeeds with invalid push token (fire-and-forget)', async () => {
-    r = await req('POST', '/api/v1/shifts/open', W1);
-    if (r.status !== 201 && r.status !== 409) {
-      console.log('  shift error:', JSON.stringify(r.body));
-    }
+    await ensureOpenShift(W1, 'joseph');
 
     // Register a fake push token
     const pool = getPool();
@@ -133,23 +143,19 @@ async function main() {
 
   await test('Handover settlement notifies starter', async () => {
     // Get musa to settle a handover
-    r = await req('POST', '/api/v1/auth/staff/login', undefined, { username: 'musa', password: 'Worker123!' });
-    assert(r.status === 200, 'musa login');
-    const W2 = r.body.data.access_token;
+    const W2 = await signInAs('musa');
 
     // Joseph starts a wash
+    await ensureOpenShift(W1, 'joseph');
     r = await req('POST', '/api/v1/washes', W1, { vehicle_class_id: suvId });
-    if (r.status !== 201) { console.log('  skip: wash start failed', JSON.stringify(r.body)); return; }
+    assert(r.status === 201, `wash start ${r.status} ${JSON.stringify(r.body)}`);
     const washId = r.body.data.wash_id;
 
     r = await req('POST', `/api/v1/washes/${washId}/wash-done`, W1);
     assert(r.status === 200, 'wash done');
 
     // Musa opens shift then settles as handover
-    r = await req('POST', '/api/v1/shifts/open', W2);
-    if (r.status !== 201 && r.status !== 409) {
-      console.log('  musa shift error:', JSON.stringify(r.body));
-    }
+    await ensureOpenShift(W2, 'musa');
 
     r = await req('POST', `/api/v1/washes/${washId}/settle`, W2, {
       unverified_reason: 'no_app',

@@ -1,6 +1,7 @@
 import http from 'http';
 import dotenv from 'dotenv';
 import path from 'path';
+import { signInAs } from './helpers/auth';
 
 dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
@@ -37,32 +38,16 @@ async function test(name: string, fn: () => Promise<void>) {
 
 function assert(cond: boolean, msg: string) { if (!cond) throw new Error(msg); }
 
-const OA_PWD = 'Orgadmin123!';
-const MG_PWD = 'Manager123!';
-const WK_PWD = 'Worker123!';
-
 async function main() {
-  // ── Setup ──
-  let r = await req('POST', '/api/v1/auth/staff/login', undefined, { username: 'orgadmin', password: OA_PWD });
-  let OA = r.body.data.access_token;
-  r = await req('POST', '/api/v1/auth/staff/change-password', OA, { current_password: OA_PWD, new_password: 'OrgNew1234!' });
-  r = await req('POST', '/api/v1/auth/staff/login', undefined, { username: 'orgadmin', password: 'OrgNew1234!' });
-  OA = r.body.data.access_token;
+  // ── Setup: sign in via phone + OTP ──
+  // Staff passwords were removed from the platform, along with the
+  // change-password / must-change-on-first-login rotation this setup used to
+  // perform. Sign-in is phone + OTP now, via the shared helper.
+  const OA = await signInAs('orgadmin');
+  const MG = await signInAs('grace');
+  const W1 = await signInAs('joseph');
 
-  r = await req('POST', '/api/v1/auth/staff/login', undefined, { username: 'grace', password: MG_PWD });
-  let MG = r.body.data.access_token;
-  r = await req('POST', '/api/v1/auth/staff/change-password', MG, { current_password: MG_PWD, new_password: 'MgrNew1234!' });
-  r = await req('POST', '/api/v1/auth/staff/login', undefined, { username: 'grace', password: 'MgrNew1234!' });
-  MG = r.body.data.access_token;
-
-  r = await req('POST', '/api/v1/auth/staff/login', undefined, { username: 'joseph', password: WK_PWD });
-  if (r.status !== 200) { console.log('joseph login fail:', r.status, JSON.stringify(r.body)); process.exit(1); }
-  let WT1 = r.body.data.access_token;
-  r = await req('POST', '/api/v1/auth/staff/change-password', WT1, { current_password: WK_PWD, new_password: 'WkNew1234!' });
-  if (r.status !== 200) { console.log('joseph chg fail:', r.status, JSON.stringify(r.body)); process.exit(1); }
-  r = await req('POST', '/api/v1/auth/staff/login', undefined, { username: 'joseph', password: 'WkNew1234!' });
-  if (r.status !== 200) { console.log('joseph relogin fail:', r.status, JSON.stringify(r.body)); process.exit(1); }
-  const W1 = r.body.data.access_token;
+  let r: { status: number; body: any };
 
   // Get IDs
   r = await req('GET', '/api/v1/branches', OA);
@@ -75,13 +60,38 @@ async function main() {
   r = await req('GET', '/api/v1/services', MG);
   const fullWashId = r.body.data.find((s: any) => s.name === 'Full wash').id;
 
-  // Get client ID (seeded Peter O.)
-  r = await req('GET', '/api/v1/clients/lookup?phone=%2B256700123456', W1);
-  const clientId = r.body.data?.id;
+  // Get a client to run the loyalty tests against.
+  // This used to hardcode Peter O.'s phone, but the seed has since moved it,
+  // so the lookup 404'd and every loyalty test below silently skipped. Resolve
+  // him by name instead, and fall back to whichever client the org has.
+  r = await req('GET', '/api/v1/clients?q=Peter', OA);
+  let client = r.body?.data?.clients?.[0];
+  if (!client) {
+    r = await req('GET', '/api/v1/clients?limit=1', OA);
+    client = r.body?.data?.clients?.[0];
+  }
+  const clientId: string | undefined = client?.id;
+  const clientMemberCode: string | undefined = client?.member_code;
+  if (!clientId) console.log('WARNING: no client found — loyalty tests will skip');
 
-  // Open shift for worker1
+  // Open shift for worker1.
+  // The seed can leave joseph's last shift in 'pending_close', which blocks
+  // /shifts/open with 409 yet is not usable for washes. Reopen it in that case
+  // rather than bailing out.
   r = await req('POST', '/api/v1/shifts/open', W1);
-  if (r.status !== 201) {
+  if (r.status === 409) {
+    const cur = await req('GET', '/api/v1/shifts/current', W1);
+    if (cur.status === 200 && cur.body.data?.status === 'pending_close') {
+      const re = await req('POST', `/api/v1/shifts/${cur.body.data.id}/reopen`, W1);
+      if (re.status !== 200) {
+        console.log('ERROR: cannot reopen pending_close shift', JSON.stringify(re.body));
+        process.exit(1);
+      }
+    } else if (cur.status !== 200) {
+      console.log('ERROR: shift open conflicted but no current shift', JSON.stringify(cur.body));
+      process.exit(1);
+    }
+  } else if (r.status !== 201) {
     console.log('ERROR: cannot open shift', JSON.stringify(r.body));
     process.exit(1);
   }
@@ -265,11 +275,9 @@ async function main() {
     }, { 'Idempotency-Key': 'p5-disc-' + Date.now() });
     const wId = r.body.data.wash_id;
 
-    // Attach client
-    r = await req('GET', '/api/v1/clients/lookup?phone=%2B256700123456', W1);
-    if (r.body.data) {
-      // Use the member_code to attach
-      r = await req('POST', `/api/v1/washes/${wId}/attach-client`, W1, { member_code: r.body.data.member_code });
+    // Attach client (member code resolved during setup)
+    if (clientMemberCode) {
+      r = await req('POST', `/api/v1/washes/${wId}/attach-client`, W1, { member_code: clientMemberCode });
     }
 
     r = await req('POST', `/api/v1/washes/${wId}/wash-done`, W1);
@@ -457,12 +465,27 @@ async function main() {
     }
     const shiftId = r.body.data.id;
 
+    // A shift with in-progress washes cannot be closed. Earlier tests in this
+    // file leave some behind, which used to make this test skip itself — and a
+    // skip still counted as a pass, so the variance rule below was never
+    // actually checked. Clear the blockers instead of giving up.
     r = await req('POST', `/api/v1/shifts/${shiftId}/request-close`, W1);
     if (r.status !== 200) {
-      // Still has in_progress washes, skip
-      console.log('  (skip: shift has in_progress washes)');
-      return;
+      // Cancel this worker's in-progress washes. Filtered by worker, not by
+      // shift: GET /washes does not return any shift id, so there is nothing
+      // to match a shift against — and an open shift's in-progress washes are
+      // that worker's by definition.
+      const detail = await req('GET', `/api/v1/shifts/${shiftId}`, MG);
+      const workerId = detail.body?.data?.worker_id;
+      const queue = await req('GET', `/api/v1/washes?status=in_progress&worker_id=${workerId}`, OA);
+      for (const w of (queue.body?.data || [])) {
+        // `reason` is an enum, not free text.
+        await req('POST', `/api/v1/washes/${w.id}/cancel`, MG, { reason: 'started_by_mistake' });
+      }
+      r = await req('POST', `/api/v1/shifts/${shiftId}/request-close`, W1);
     }
+    assert(r.status === 200, `request-close (got ${r.status} ${JSON.stringify(r.body?.error || {})})`);
+    if (r.status !== 200) return;
 
     r = await req('POST', `/api/v1/shifts/${shiftId}/close`, MG, { counted_cash_ugx: 100000 });
     assert(r.status === 200, 'close shift');

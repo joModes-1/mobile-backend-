@@ -1,4 +1,5 @@
 import http from 'http';
+import { signInAs } from './helpers/auth';
 
 const BASE = 'http://localhost:3456';
 
@@ -45,58 +46,16 @@ function assert(cond: boolean, msg: string) {
   if (!cond) throw new Error(msg);
 }
 
-const OA_PWD = 'Orgadmin123!';
-const MG_PWD = 'Manager123!';
-const WK_PWD = 'Worker123!';
-const MG_NEW = 'Manager321!';
-const WK_NEW = 'Worker321!';
-
 async function main() {
-  // ---- Setup: change passwords and get tokens ----
-  // Orgadmin (must_change_password=true, but change-pwd is in allowed paths)
-  let r = await req('POST', '/api/v1/auth/staff/login', undefined, { username: 'orgadmin', password: OA_PWD });
-  assert(r.status === 200, 'orgadmin login ' + r.status + ' ' + JSON.stringify(r.body));
-  let OA = r.body.data.access_token;
-  r = await req('POST', '/api/v1/auth/staff/change-password', OA, { current_password: OA_PWD, new_password: 'OrgNew1234!' });
-  assert(r.status === 200, 'orgadmin change-pwd ' + r.status);
-  r = await req('POST', '/api/v1/auth/staff/login', undefined, { username: 'orgadmin', password: 'OrgNew1234!' });
-  OA = r.body.data.access_token;
+  // ---- Setup: sign in via phone + OTP ----
+  // Staff passwords (and the must-change-password / change-password flow that
+  // went with them) were removed from the platform; sign-in is phone + OTP now.
+  const OA = await signInAs('orgadmin');
+  const MG = await signInAs('grace');
+  const WT1f = await signInAs('joseph');
+  const WT2f = await signInAs('musa');
 
-  // Manager — must change password first
-  r = await req('POST', '/api/v1/auth/staff/login', undefined, { username: 'grace', password: MG_PWD });
-  assert(r.status === 200, 'manager login ' + r.status + ' ' + JSON.stringify(r.body));
-  let MG = r.body.data.access_token;
-  r = await req('POST', '/api/v1/auth/staff/change-password', MG, { current_password: MG_PWD, new_password: MG_NEW });
-  assert(r.status === 200, 'manager change-pwd ' + r.status);
-  r = await req('POST', '/api/v1/auth/staff/login', undefined, { username: 'grace', password: MG_NEW });
-  MG = r.body.data.access_token;
-
-  // Workers — must change password
-  // Worker joseph
-  r = await req('POST', '/api/v1/auth/staff/login', undefined, { username: 'joseph', password: WK_PWD });
-  console.log('  joseph login:', r.status, JSON.stringify(r.body).slice(0, 120));
-  assert(r.status === 200, 'joseph login ' + r.status);
-  let WT1 = r.body.data.access_token;
-  r = await req('POST', '/api/v1/auth/staff/change-password', WT1, { current_password: WK_PWD, new_password: WK_NEW });
-  console.log('  joseph chg:', r.status, JSON.stringify(r.body).slice(0, 120));
-  assert(r.status === 200, 'worker1 change-pwd ' + r.status + ' ' + JSON.stringify(r.body));
-  r = await req('POST', '/api/v1/auth/staff/login', undefined, { username: 'joseph', password: WK_NEW });
-  console.log('  joseph relogin:', r.status, JSON.stringify(r.body).slice(0, 120));
-  assert(r.status === 200, 'joseph relogin ' + r.status + ' ' + JSON.stringify(r.body));
-  const WT1f = r.body.data.access_token;
-
-  // Worker musa
-  r = await req('POST', '/api/v1/auth/staff/login', undefined, { username: 'musa', password: WK_PWD });
-  console.log('  musa login:', r.status, JSON.stringify(r.body).slice(0, 120));
-  assert(r.status === 200, 'musa login ' + r.status);
-  let WT2 = r.body.data.access_token;
-  r = await req('POST', '/api/v1/auth/staff/change-password', WT2, { current_password: WK_PWD, new_password: WK_NEW });
-  console.log('  musa chg:', r.status, JSON.stringify(r.body).slice(0, 120));
-  assert(r.status === 200, 'worker2 change-pwd ' + r.status + ' ' + JSON.stringify(r.body));
-  r = await req('POST', '/api/v1/auth/staff/login', undefined, { username: 'musa', password: WK_NEW });
-  console.log('  musa relogin:', r.status, JSON.stringify(r.body).slice(0, 120));
-  assert(r.status === 200, 'musa relogin ' + r.status + ' ' + JSON.stringify(r.body));
-  const WT2f = r.body.data.access_token;
+  let r: { status: number; body: any };
 
   // Get branch IDs (use OA to see all branches)
   r = await req('GET', '/api/v1/branches', OA);
@@ -106,6 +65,28 @@ async function main() {
   assert(Array.isArray(branches) && branches.length >= 2, 'expected >=2 branches, got ' + branches?.length);
   const NTD = branches.find((b: any) => b.code === 'NTD').id;
   const KBL = branches.find((b: any) => b.code === 'KBL').id;
+
+  // ---- Reset: close shifts left open by a previous run ----
+  // A shift row survives the run that created it, so on a second run every
+  // worker already has one and `POST /shifts/open` answers 409 — which used
+  // to cascade into half the suite asserting against an undefined shift id.
+  // Close whatever is still hanging so each run starts from the same state.
+  // In-progress washes have to go first: both request-close and close refuse
+  // a shift whose holder still has one (IN_PROGRESS_WASHES).
+  for (const t of [WT1f, WT2f]) {
+    const q = await req('GET', '/api/v1/washes/queue', t);
+    for (const w of (q.body?.data?.washing || [])) {
+      await req('POST', `/api/v1/washes/${w.id}/cancel`, t, { reason: 'other' });
+    }
+  }
+  r = await req('GET', '/api/v1/shifts', OA);
+  for (const s of (r.body?.data || []).filter((x: any) => x.status !== 'closed')) {
+    for (const t of [WT1f, WT2f, MG]) {
+      const rc = await req('POST', `/api/v1/shifts/${s.id}/request-close`, t);
+      if (rc.status === 200) break;
+    }
+    await req('POST', `/api/v1/shifts/${s.id}/close`, OA, { counted_cash_ugx: 0 });
+  }
 
   // ---- TESTS ----
 

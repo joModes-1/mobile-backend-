@@ -504,18 +504,52 @@ zero tests. There are now `test:phase2` … `test:phase7`, `test:e2e` and
 `test:all` scripts that invoke them properly, and `phase2-test.ts` exits
 non-zero on failure like the rest.
 
-They need a **pristine database**: several change the credentials they
-authenticate with (`phase3-test.ts` changes the orgadmin password during
-setup), and the seeder is idempotent, so re-seeding does not put the original
-back. See `tests/README.md`. They also still sign in with username and
-password, so they exercise a path no real user takes — **the phone flow has no
-automated coverage at all.**
+### September 2026 — the suites now actually run
+
+Two problems made the whole safety net worthless, both now fixed.
+
+**They were dead.** Every suite authenticated through `POST
+/auth/staff/login`, which no longer exists — so all seven crashed at setup
+before asserting anything. Sign-in moved into `tests/helpers/auth.ts`, which
+does the phone + OTP round-trip and caches the token per number; the suites
+call `signInAs('orgadmin' | 'grace' | 'joseph' | 'musa')`. Assertions that
+existed only to test password login or rotation were deleted with the
+mechanism. The phone flow, which previously had **no** automated coverage, is
+now the path every suite exercises.
+
+**They needed a pristine database.** Several suites mutated the state they
+depended on and only passed once per `dropdb`. Each now normalises its own
+starting state and cleans up what it creates.
+
+The result: **195 assertions across 8 suites, passing twice back-to-back
+against the same database.** A red run now means a regression, which is the
+whole point.
+
+Two supporting changes were needed:
+
+- `/auth/phone/start`'s 3-per-hour limit is raised under `TEST_MODE`
+  (`phoneAuth.ts`). The suites sign the same few seeded numbers in dozens of
+  times and would otherwise exhaust the budget mid-run. Production never sets
+  `TEST_MODE`, so the real limit is untouched.
+- `e2e-test.ts` no longer drops the database, re-migrates, re-seeds and spawns
+  its own server on `:3456` — that destroyed the data every other suite shares
+  and fought with the running dev server. It now runs against the server
+  already up, like the rest.
+
+Also worth knowing: one phase-5 assertion — that reversing a wash must not
+change a **closed** shift's variance — was silently skipping itself whenever
+leftover in-progress washes blocked the close, and a skip counted as a pass.
+It had therefore never run. It now clears the blockers and genuinely executes.
+Five phase-5 loyalty assertions were passing vacuously for a similar reason (a
+hardcoded client phone that no longer matched anyone, behind a skip guard).
+
+See `tests/README.md`.
 
 ## Still open
 
-- `GET /shifts/:id` returns `washes: []` unconditionally
-  (`shiftRoutes.ts:456`, "Washes will be added in Phase 4"). Phase 4 shipped
-  long ago. Dormant only because nothing calls the endpoint.
+- ~~`GET /shifts/:id` returns `washes: []` unconditionally.~~ **Fixed.** It
+  now joins the shift's real washes, and `phase11-test.ts` asserts a shift
+  with settled work comes back with a non-empty list.
 - ~~Loyalty adjustment is defined twice.~~ **Fixed.** The duplicate in
   `exceptionRoutes.ts` has been deleted. It was mounted under `/washes`, so
   it answered at `/washes/:id/loyalty/adjust` while reading `:id` as a

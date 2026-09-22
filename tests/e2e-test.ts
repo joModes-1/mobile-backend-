@@ -1,23 +1,22 @@
 /**
  * Phase 10 — End-to-End System Verification
  *
- * Run from empty database: drop → migrate → seed → run all acts → report.
+ * Runs every act against an ALREADY-RUNNING server with TEST_MODE=true, the
+ * same way the phase suites do. It no longer drops and re-seeds the database
+ * first: that wiped the data every other suite shares, and spawning a second
+ * server fought with the one already on the port.
+ *
  * Collects failures rather than exiting on first failure.
  */
 
 import http from 'http';
 import dotenv from 'dotenv';
 import path from 'path';
-import { execSync } from 'child_process';
-import { Pool } from 'pg';
+import { signInAs } from './helpers/auth';
 
 dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
 const BASE = 'http://localhost:3456';
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-// Admin pool for drop/create — connects to 'postgres' database
-const adminUrl = (process.env.DATABASE_URL || '').replace(/\/[^\/]*$/, '/postgres');
-const adminPool = new Pool({ connectionString: adminUrl });
 
 // ─── Test harness ────────────────────────────────────────────
 
@@ -76,56 +75,30 @@ async function act(actName: string, tests: Array<{ name: string; fn: () => Promi
 const state: Record<string, any> = {};
 
 // ═══════════════════════════════════════════════════════════════
-// STEP 1-3: TEAR DOWN, MIGRATE, SEED
-// ═══════════════════════════════════════════════════════════════
-
-async function setup(): Promise<void> {
-  console.log('🔄 Dropping and recreating database...');
-  await adminPool.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'era92' AND pid <> pg_backend_pid()`);
-  await adminPool.query('DROP DATABASE IF EXISTS era92');
-  await adminPool.query('CREATE DATABASE era92');
-  await adminPool.end();
-  await pool.end();
-
-  const serverDir = path.resolve(__dirname, '..');
-  console.log('🔄 Running migrations...');
-  execSync('npx knex migrate:latest --knexfile knexfile.ts', { cwd: serverDir, stdio: 'inherit' });
-
-  console.log('🔄 Running seed...');
-  execSync('npx knex seed:run --knexfile knexfile.ts', { cwd: serverDir, stdio: 'inherit' });
-
-  // Clear must_change_password for all users
-  const p = new Pool({ connectionString: process.env.DATABASE_URL });
-  await p.query('UPDATE staff_users SET must_change_password = false');
-  await p.query('UPDATE platform_admins SET must_change_password = false');
-  await p.end();
-}
-
-// ═══════════════════════════════════════════════════════════════
 // MAIN
 // ═══════════════════════════════════════════════════════════════
 
 async function main() {
   const startTime = Date.now();
 
-  await setup();
-
-  // Start server
-  console.log('🔄 Starting server...');
-  const { spawn } = require('child_process');
-  const { exec } = require('child_process');
-  const server = exec('npx ts-node-dev -r tsconfig-paths/register src/server.ts', {
-    cwd: path.resolve(__dirname, '..'),
-    env: { ...process.env, PORT: '3456' },
-  });
-
-  // Wait for server to be ready
+  // This suite used to drop the database, re-migrate, re-seed and spawn its
+  // own server on :3456. It now runs against the server and database that are
+  // already up, so it no longer fights a dev server for the port or destroys
+  // the data the other suites are sharing. Assertions that depended on a
+  // pristine database were loosened to assert relationships instead of the
+  // exact counts a fresh seed happened to produce.
+  console.log('🔄 Checking server on ' + BASE + '...');
+  let up = false;
   for (let i = 0; i < 30; i++) {
     try {
       const r = await req('GET', '/api/v1/health');
-      if (r.status === 200) break;
+      if (r.status === 200) { up = true; break; }
     } catch {}
     await new Promise((r) => setTimeout(r, 1000));
+  }
+  if (!up) {
+    console.error(`No server answering on ${BASE}. Start it with \`npm run dev\` (TEST_MODE=true) and re-run.`);
+    process.exit(1);
   }
 
   console.log('🚀 Server ready. Running acts...\n');
@@ -154,11 +127,23 @@ async function main() {
       },
     },
     {
-      name: 'Platform stats returns no wash/client rows',
+      name: 'Platform stats returns coherent org/wash counts',
       fn: async () => {
+        // This used to assert `data.washes === 0` against a freshly seeded
+        // database. There is no `washes` key on the payload at all (it reports
+        // washes_today / washes_this_month), so the check passed vacuously on
+        // `undefined` and never tested anything. Assert the shape and the
+        // relationships between the figures instead, which hold whatever data
+        // the database happens to be carrying.
         const r = await req('GET', '/api/v1/reports/platform/stats', state.sysadmin);
         assert(r.status === 200, `status ${r.status}`);
-        assert(!r.body.data.washes || r.body.data.washes === 0, 'no washes');
+        const d = r.body.data;
+        for (const k of ['total_orgs', 'active_orgs', 'washes_today', 'washes_this_month']) {
+          assert(d[k] !== undefined, `missing ${k}`);
+          assert(Number.isFinite(Number(d[k])), `${k} not numeric: ${d[k]}`);
+        }
+        assert(Number(d.active_orgs) <= Number(d.total_orgs), 'active_orgs <= total_orgs');
+        assert(Number(d.washes_today) <= Number(d.washes_this_month), 'washes_today <= washes_this_month');
       },
     },
     {
@@ -174,33 +159,25 @@ async function main() {
 
   await act('Act 2 — Setup', [
     {
-      name: 'Orgadmin login',
+      // Staff passwords are gone; every role signs in by phone + OTP now.
+      name: 'Orgadmin sign-in (phone + OTP)',
       fn: async () => {
-        const r = await req('POST', '/api/v1/auth/staff/login', undefined, {
-          username: 'orgadmin', password: 'Orgadmin123!',
-        });
-        assert(r.status === 200, `status ${r.status}`);
-        state.orgadmin = r.body.data.access_token;
+        state.orgadmin = await signInAs('orgadmin');
+        assert(!!state.orgadmin, 'no token');
       },
     },
     {
-      name: 'Manager login',
+      name: 'Manager sign-in (phone + OTP)',
       fn: async () => {
-        const r = await req('POST', '/api/v1/auth/staff/login', undefined, {
-          username: 'grace', password: 'Manager123!',
-        });
-        assert(r.status === 200, `status ${r.status}`);
-        state.manager = r.body.data.access_token;
+        state.manager = await signInAs('grace');
+        assert(!!state.manager, 'no token');
       },
     },
     {
-      name: 'Worker login',
+      name: 'Worker sign-in (phone + OTP)',
       fn: async () => {
-        const r = await req('POST', '/api/v1/auth/staff/login', undefined, {
-          username: 'joseph', password: 'Worker123!',
-        });
-        assert(r.status === 200, `status ${r.status}`);
-        state.worker = r.body.data.access_token;
+        state.worker = await signInAs('joseph');
+        assert(!!state.worker, 'no token');
       },
     },
     {
@@ -252,68 +229,36 @@ async function main() {
     },
   ]);
 
-  // ═══ ACT 3: Reset ladder ═══
-
-  await act('Act 3 — Reset ladder', [
-    {
-      name: 'Orgadmin resets worker → 200',
-      fn: async () => {
-        // Get worker ID first
-        const staffList = await req('GET', '/api/v1/staff', state.orgadmin);
-        const joseph = staffList.body.data.find((s: any) => s.username === 'joseph');
-        assert(joseph, 'joseph found');
-        const r = await req('POST', `/api/v1/staff/${joseph.id}/reset-password`, state.orgadmin);
-        assert(r.status === 200, `status ${r.status} ${JSON.stringify(r.body)}`);
-      },
-    },
-    {
-      name: 'Worker must change password → 403',
-      fn: async () => {
-        const r = await req('GET', '/api/v1/vehicle-classes', state.worker);
-        assert(r.status === 403, `expected 403 got ${r.status}`);
-      },
-    },
-    {
-      name: 'Worker re-login after reset and change password',
-      fn: async () => {
-        const staffList = await req('GET', '/api/v1/staff', state.orgadmin);
-        const joseph = staffList.body.data.find((s: any) => s.username === 'joseph');
-        const reset = await req('POST', `/api/v1/staff/${joseph.id}/reset-password`, state.orgadmin);
-        const tempPwd = reset.body.data?.temp_password;
-        if (tempPwd) {
-          // Login with temp password (must_change_password=true)
-          const r = await req('POST', '/api/v1/auth/staff/login', undefined, {
-            username: 'joseph', password: tempPwd,
-          });
-          assert(r.status === 200, `login ${r.status}`);
-          // Change password to remove must_change flag
-          const r2 = await req('POST', '/api/v1/auth/staff/change-password', r.body.data.access_token, {
-            current_password: tempPwd,
-            new_password: 'Worker321!x',
-          });
-          assert(r2.status === 200, `change-pwd ${r2.status}`);
-          // Wait for rate limiter to clear
-          await new Promise(r => setTimeout(r, 1000));
-          // Re-login with new password
-          const r3 = await req('POST', '/api/v1/auth/staff/login', undefined, {
-            username: 'joseph', password: 'Worker321!x',
-          });
-          assert(r3.status === 200, `re-login ${r3.status}`);
-          state.worker = r3.body.data.access_token;
-        }
-      },
-    },
-  ]);
+  // ═══ ACT 3: Reset ladder — REMOVED ═══
+  //
+  // Act 3 asserted the password-reset ladder end to end: orgadmin resets a
+  // worker, the worker is then locked out with must_change_password, logs in
+  // with the temp password, rotates it and carries on. All three assertions
+  // tested the password flow and nothing else, and that flow was removed from
+  // the platform along with staff passwords — sign-in is phone + OTP, so there
+  // is no password to reset, no temp password to issue and no rotation step.
+  // The assertions are deleted rather than rewritten because there is no
+  // longer any behaviour behind them.
 
   // ═══ ACT 4: Business day ═══
 
   await act('Act 4 — Business day', [
     {
-      name: 'Worker opens shift',
+      name: 'Worker has an open shift',
       fn: async () => {
+        // What the rest of Act 4 needs is an open shift, not necessarily one
+        // this run created. Against a shared database the worker often still
+        // has yesterday's shift open (409 SHIFT_ALREADY_OPEN), which is a
+        // legitimate starting state rather than a failure — so assert the
+        // end state via /shifts/current instead of the 201 from /open.
         const r = await req('POST', '/api/v1/shifts/open', state.worker);
-        assert(r.status === 201, `status ${r.status} ${JSON.stringify(r.body)}`);
-        state.workerShiftId = r.body.data.id;
+        const alreadyOpen = r.status === 409 && r.body?.error?.code === 'SHIFT_ALREADY_OPEN';
+        assert(r.status === 201 || alreadyOpen, `status ${r.status} ${JSON.stringify(r.body)}`);
+
+        const cur = await req('GET', '/api/v1/shifts/current', state.worker);
+        assert(cur.status === 200, `shifts/current ${cur.status} ${JSON.stringify(cur.body)}`);
+        assert(cur.body.data.status === 'open', `shift status ${cur.body.data.status}`);
+        state.workerShiftId = cur.body.data.id;
       },
     },
     {
@@ -468,7 +413,9 @@ async function main() {
     {
       name: 'Malformed JSON → 400 envelope',
       fn: async () => {
-        const r = await req('POST', '/api/v1/auth/staff/login', undefined, 'not json');
+        // Any unauthenticated POST will do — this exercises the JSON body
+        // parser, not the (now removed) password login it used to target.
+        const r = await req('POST', '/api/v1/auth/phone/start', undefined, 'not json');
         // Express should return 400 for malformed JSON
         assert(r.status === 400 || r.status === 500, `status ${r.status}`);
       },
@@ -509,7 +456,6 @@ async function main() {
     }
   }
 
-  server.kill();
   process.exit(fail > 0 ? 1 : 0);
 }
 

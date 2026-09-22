@@ -32,6 +32,21 @@ const OTP_RATE_LIMIT = 3;
 const OTP_RATE_WINDOW = 60 * 60 * 1000;
 const otpRateLimits = new Map<string, { count: number; windowStart: number }>();
 
+/**
+ * Three codes an hour is right for real numbers — it is what stops an
+ * attacker walking a range, and what stops us paying for a flood of SMS.
+ *
+ * It is wrong for the test suites, which sign the same handful of seeded
+ * numbers in dozens of times across seven files and would otherwise spend
+ * their budget before the first suite finished. TEST_MODE already changes
+ * this endpoint's behaviour (it returns the code in the response instead of
+ * sending an SMS), so the limit rides on the same switch. Production never
+ * sets TEST_MODE, so the real limit there is unchanged.
+ */
+function otpRateLimit(): number {
+  return getEnv().TEST_MODE ? 1000 : OTP_RATE_LIMIT;
+}
+
 function checkOtpRateLimit(phone: string): void {
   const now = Date.now();
   const record = otpRateLimits.get(phone);
@@ -39,7 +54,7 @@ function checkOtpRateLimit(phone: string): void {
     otpRateLimits.set(phone, { count: 1, windowStart: now });
     return;
   }
-  if (record.count >= OTP_RATE_LIMIT) {
+  if (record.count >= otpRateLimit()) {
     throw createAppError(429, 'OTP_RATE_LIMITED', 'Too many requests. Try again later.');
   }
   record.count++;
@@ -276,7 +291,22 @@ router.post('/verify', async (req: Request, res: Response, next: NextFunction) =
     )).rows[0];
 
     if (!row) {
-      const orgResult = await conn.query("SELECT id FROM organizations WHERE status = 'active' LIMIT 1");
+      // Which organisation does a brand-new customer belong to?
+      //
+      // Nothing in a sign-up says: they type a phone number, and that is all.
+      // This used to be `LIMIT 1` with no ORDER BY, so Postgres returned
+      // whichever active org it felt like — in practice the SECOND one. Every
+      // new customer landed in an org with no staff, and the moment a worker
+      // scanned their code the wash was refused with WRONG_ORG, which the app
+      // showed as "that code has expired". The code was fine; the customer was
+      // in the wrong tenant.
+      //
+      // Until customers pick a branch at sign-up, the oldest active org is the
+      // stable answer — it is the real one on a single-tenant deployment, and
+      // deterministic on any other, which an unordered LIMIT 1 never was.
+      const orgResult = await conn.query(
+        "SELECT id FROM organizations WHERE status = 'active' ORDER BY created_at ASC LIMIT 1"
+      );
       if (orgResult.rows.length === 0) {
         await conn.query('ROLLBACK');
         next(createAppError(500, 'NO_ORG', 'No active organization found'));

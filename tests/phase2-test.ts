@@ -1,3 +1,5 @@
+import { signInAs } from './helpers/auth';
+
 const http = require('http');
 
 function api(method: string, path: string, body?: any, token?: string): Promise<any> {
@@ -25,21 +27,11 @@ function check(name: string, cond: boolean) {
 }
 
 async function main() {
-  // Login as orgadmin
-  let oa = await api('POST', '/api/v1/auth/staff/login', { username: 'orgadmin', password: 'Orgadmin123!' });
-  await api('POST', '/api/v1/auth/staff/change-password', { current_password: 'Orgadmin123!', new_password: 'Xoa1234!' }, oa.data.access_token);
-  oa = await api('POST', '/api/v1/auth/staff/login', { username: 'orgadmin', password: 'Xoa1234!' });
-  const oaToken = oa.data.access_token;
-
-  // Login as manager
-  let mg = await api('POST', '/api/v1/auth/staff/login', { username: 'grace', password: 'Manager123!' });
-  await api('POST', '/api/v1/auth/staff/change-password', { current_password: 'Manager123!', new_password: 'Xmgr123!' }, mg.data.access_token);
-  mg = await api('POST', '/api/v1/auth/staff/login', { username: 'grace', password: 'Xmgr123!' });
-  const mgToken = mg.data.access_token;
-
-  // Login as worker
-  let w = await api('POST', '/api/v1/auth/staff/login', { username: 'joseph', password: 'Worker123!' });
-  const wToken = w.data.access_token;
+  // Sign in by phone + OTP. Staff passwords no longer exist, so the old
+  // login-then-change-password dance is gone with them.
+  const oaToken = await signInAs('orgadmin');
+  const mgToken = await signInAs('grace');
+  const wToken = await signInAs('joseph');
 
   // Get branch IDs
   const branches = await api('GET', '/api/v1/branches', null, oaToken);
@@ -52,9 +44,15 @@ async function main() {
   const vcs = await api('GET', '/api/v1/vehicle-classes', null, oaToken);
   check('List vehicle classes (5)', vcs.ok && vcs.data.length === 5);
 
-  // 2. List services
+  // 2. List services. Counted against the baseline taken here rather than a
+  // literal 4: this suite creates a throwaway service further down, and any
+  // earlier crashed run may have left one behind.
+  // GET /services returns inactive rows too, while the price matrix and
+  // /prices/effective cover only active ones — so count actives here, which
+  // is the number those two endpoints are expected to agree with.
   const svcs = await api('GET', '/api/v1/services', null, oaToken);
-  check('List services (4)', svcs.ok && svcs.data.length === 4);
+  const baselineServiceCount = (svcs.data || []).filter((s: any) => s.active).length;
+  check('List services (>= 4 seeded)', svcs.ok && baselineServiceCount >= 4);
   check('One default service', svcs.data.filter((s: any) => s.is_default).length === 1);
 
   // 3. Duplicate vehicle class -> 409
@@ -70,7 +68,7 @@ async function main() {
   // 5. GET /prices matrix
   const matrix = await api('GET', '/api/v1/prices?branch_id=' + ntdId, null, oaToken);
   check('GET /prices returns matrix', matrix.ok && matrix.data.matrix.length > 0);
-  check('GET /prices returns services', matrix.data.services.length === 4);
+  check('GET /prices returns every service', matrix.data.services.length === baselineServiceCount);
   check('GET /prices returns vehicle_classes', matrix.data.vehicle_classes.length === 5);
   check('GET /prices missing array exists', Array.isArray(matrix.data.missing));
 
@@ -98,10 +96,13 @@ async function main() {
   const effective = await api('GET', '/api/v1/prices/effective?branch_id=' + ntdId, null, oaToken);
   check('Effective prices returned', effective.ok && effective.data.vehicle_classes.length === 5);
   const effSuv = effective.data.vehicle_classes.find((vc: any) => vc.name === 'SUV');
-  check('Effective has services nested', effSuv?.services?.length === 4);
+  check('Effective has every service nested', effSuv?.services?.length === baselineServiceCount);
   const effSuvFull = effSuv?.services.find((s: any) => s.name === 'Full wash');
   check('Effective SUV Full Wash has_price=true', effSuvFull?.has_price === true);
-  check('Effective SUV Full Wash = override (27500)', effSuvFull?.price_ugx === 27500);
+  // Assert the two endpoints agree rather than pinning a literal: the price
+  // is seed data that later suites (and this one) legitimately overwrite.
+  check('Effective SUV Full Wash = the branch override from /prices',
+    effSuvFull?.price_ugx === ntdSuvFull?.effective_price_ugx);
 
   console.log('\n=== PRICE WRITE TESTS ===');
 
@@ -121,7 +122,10 @@ async function main() {
 
   // 12. Manager tries org-wide -> 403
   const mgrOrgWide = await api('PUT', '/api/v1/prices', { service_id: halfWash.id, vehicle_class_id: saloonClass.id, price_ugx: 14000 }, mgToken);
-  check('Manager blocked from org-wide (403)', mgrOrgWide.error?.code === 'FORBIDDEN');
+  // The block is what matters, not which code carries it: org-wide writes now
+  // answer SHARED_CATALOGUE_ITEM, which says the same thing more usefully.
+  check('Manager blocked from org-wide (403)',
+    mgrOrgWide.error?.code === 'FORBIDDEN' || mgrOrgWide.error?.code === 'SHARED_CATALOGUE_ITEM');
 
   // 13. Worker writes price -> 403
   const workerPrice = await api('PUT', '/api/v1/prices', { service_id: halfWash.id, vehicle_class_id: saloonClass.id, price_ugx: 5000 }, wToken);
@@ -138,15 +142,20 @@ async function main() {
   await api('PATCH', '/api/v1/vehicle-classes/' + saloonClass.id, { active: true }, oaToken);
 
   // 16. resolvePrice no price -> 422
+  // Needs a service with no price against Truck. Use a fresh name each run:
+  // re-creating a fixed one fails on the second run, and re-using an existing
+  // service risks picking one that has since been given a price.
   const truckClass = vcs.data.find((v: any) => v.name === 'Truck');
-  const newSvc = await api('POST', '/api/v1/services', { name: 'Tyre Polish', earns_point: false }, oaToken);
-  const resolveNoPrice = await api('POST', '/api/v1/prices/resolve', { service_id: newSvc.data.id, vehicle_class_id: truckClass.id, branch_id: ntdId }, oaToken);
+  const newSvc = await api('POST', '/api/v1/services', { name: 'Tyre Polish ' + Date.now(), earns_point: false }, oaToken);
+  const resolveNoPrice = await api('POST', '/api/v1/prices/resolve', { service_id: newSvc.data?.id, vehicle_class_id: truckClass.id, branch_id: ntdId }, oaToken);
   check('resolvePrice no price (422)', resolveNoPrice.error?.code === 'NO_PRICE_SET');
 
-  // 17. Client token blocked
-  let clientReg = await api('POST', '/api/v1/auth/client/register', { full_name: 'Test', phone: '+256700111111', password: 'test123' });
-  let clientVerify = await api('POST', '/api/v1/auth/client/verify-otp', { phone: '+256700111111', code: clientReg.data.otp_code });
-  const clientPrice = await api('GET', '/api/v1/prices', null, clientVerify.data.access_token);
+  // 17. Client token blocked. Clients sign in by phone like everyone else
+  // now — /auth/client/register and its password are gone.
+  const clientPhone = '+256700111111';
+  const clientStart = await api('POST', '/api/v1/auth/phone/start', { phone: clientPhone });
+  const clientVerify = await api('POST', '/api/v1/auth/phone/verify', { phone: clientPhone, code: clientStart.data?.otp_code });
+  const clientPrice = await api('GET', '/api/v1/prices', null, clientVerify.data?.access_token);
   check('Client blocked from price endpoints', clientPrice.error?.code === 'FORBIDDEN');
 
   // 18. Bulk upsert
@@ -158,6 +167,13 @@ async function main() {
   // 19. Audit rows
   const history = await api('GET', '/api/v1/prices/history', null, oaToken);
   check('Price history from audit_logs', history.ok && history.data.length > 0);
+
+  // Clean up the throwaway service so the counts above stay meaningful on the
+  // next run. Services are deactivated rather than deleted — nothing in this
+  // codebase hard-deletes catalogue rows, since washes reference them.
+  if (newSvc.data?.id) {
+    await api('PATCH', '/api/v1/services/' + newSvc.data.id, { active: false }, oaToken);
+  }
 
   console.log('\n=== Results: ' + passCount + ' passed, ' + failCount + ' failed ===');
   // Exit non-zero on failure, like every other phase script. Without this a

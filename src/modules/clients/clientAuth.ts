@@ -88,8 +88,12 @@ router.post('/register', async (req: Request, res: Response, next: NextFunction)
     const data = registerSchema.parse(req.body);
     const pool = getPool();
 
-    // Find the org (for now, use the first active org; in production, this would come from the request)
-    const orgResult = await pool.query("SELECT id FROM organizations WHERE status = 'active' LIMIT 1");
+    // Find the org. Ordered, because an unordered LIMIT 1 lets Postgres pick
+    // any active org — which put new customers in a tenant with no staff and
+    // made their QR unscannable (WRONG_ORG). Same fix as the phone sign-up.
+    const orgResult = await pool.query(
+      "SELECT id FROM organizations WHERE status = 'active' ORDER BY created_at ASC LIMIT 1"
+    );
     if (orgResult.rows.length === 0) {
       next(createAppError(500, 'NO_ORG', 'No active organization found'));
       return;

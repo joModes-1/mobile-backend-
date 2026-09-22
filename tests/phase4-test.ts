@@ -1,4 +1,5 @@
 import http from 'http';
+import { signInAs } from './helpers/auth';
 
 const BASE = 'http://localhost:3456';
 
@@ -47,34 +48,16 @@ function assert(cond: boolean, msg: string) {
   if (!cond) throw new Error(msg);
 }
 
-const OA_PWD = 'Orgadmin123!';
-const MG_PWD = 'Manager123!';
-const WK_PWD = 'Worker123!';
-
 async function main() {
-  // ── Setup: login and change passwords ──
-  let r = await req('POST', '/api/v1/auth/staff/login', undefined, { username: 'orgadmin', password: OA_PWD });
-  assert(r.status === 200, 'orgadmin login ' + r.status);
-  let OA = r.body.data.access_token;
-  r = await req('POST', '/api/v1/auth/staff/change-password', OA, { current_password: OA_PWD, new_password: 'OrgNew1234!' });
-  assert(r.status === 200, 'orgadmin chg-pwd');
-  r = await req('POST', '/api/v1/auth/staff/login', undefined, { username: 'orgadmin', password: 'OrgNew1234!' });
-  OA = r.body.data.access_token;
+  // ── Setup: sign in via phone + OTP ──
+  // Staff passwords (and the change-password flow) were removed from the
+  // platform; sign-in is phone + OTP now.
+  const OA = await signInAs('orgadmin');
+  const MG = await signInAs('grace');
+  const W1 = await signInAs('joseph');
+  const W2 = await signInAs('musa');
 
-  r = await req('POST', '/api/v1/auth/staff/login', undefined, { username: 'grace', password: MG_PWD });
-  assert(r.status === 200, 'manager login');
-  let MG = r.body.data.access_token;
-  r = await req('POST', '/api/v1/auth/staff/change-password', MG, { current_password: MG_PWD, new_password: 'MgrNew1234!' });
-  assert(r.status === 200, 'manager chg-pwd');
-  r = await req('POST', '/api/v1/auth/staff/login', undefined, { username: 'grace', password: 'MgrNew1234!' });
-  MG = r.body.data.access_token;
-
-  r = await req('POST', '/api/v1/auth/staff/login', undefined, { username: 'joseph', password: WK_PWD });
-  let WT1 = r.body.data.access_token;
-  r = await req('POST', '/api/v1/auth/staff/change-password', WT1, { current_password: WK_PWD, new_password: 'WkNew1234!' });
-  assert(r.status === 200, 'worker1 chg-pwd');
-  r = await req('POST', '/api/v1/auth/staff/login', undefined, { username: 'joseph', password: 'WkNew1234!' });
-  const W1 = r.body.data.access_token;
+  let r: { status: number; body: any };
 
   // Get branches
   r = await req('GET', '/api/v1/branches', OA);
@@ -92,20 +75,30 @@ async function main() {
   const fullWashId = svcs.find((s: any) => s.name === 'Full wash').id;
   const halfWashId = svcs.find((s: any) => s.name === 'Half wash').id;
 
+  // ── Reset: clear washes and shifts left behind by a previous run ──
+  // This suite ends with joseph holding an open shift and an in_progress
+  // wash (the IN_PROGRESS_WASHES test), so a second run used to die at the
+  // setup `shifts/open` with 409. Cancel the leftover washes and close the
+  // leftover shifts so every run starts from the same state.
+  for (const t of [W1, W2]) {
+    const q = await req('GET', '/api/v1/washes/queue', t);
+    for (const w of (q.body?.data?.washing || [])) {
+      await req('POST', `/api/v1/washes/${w.id}/cancel`, t, { reason: 'other' });
+    }
+  }
+  r = await req('GET', '/api/v1/shifts', OA);
+  for (const s of (r.body?.data || []).filter((x: any) => x.status !== 'closed')) {
+    for (const t of [W1, W2, MG]) {
+      const rc = await req('POST', `/api/v1/shifts/${s.id}/request-close`, t);
+      if (rc.status === 200) break;
+    }
+    await req('POST', `/api/v1/shifts/${s.id}/close`, OA, { counted_cash_ugx: 0 });
+  }
+
   // Open a shift for worker1
   r = await req('POST', '/api/v1/shifts/open', W1);
   assert(r.status === 201, 'open shift ' + r.status + ' ' + JSON.stringify(r.body));
   const shiftId = r.body.data.id;
-
-  // ── Setup: change musa's password and store token ──
-  r = await req('POST', '/api/v1/auth/staff/login', undefined, { username: 'musa', password: WK_PWD });
-  assert(r.status === 200, 'musa initial login ' + r.status);
-  let WT2t = r.body.data.access_token;
-  r = await req('POST', '/api/v1/auth/staff/change-password', WT2t, { current_password: WK_PWD, new_password: 'WkNew1234!' });
-  assert(r.status === 200, 'musa change-pwd ' + r.status);
-  r = await req('POST', '/api/v1/auth/staff/login', undefined, { username: 'musa', password: 'WkNew1234!' });
-  assert(r.status === 200, 'musa re-login ' + r.status);
-  const W2 = r.body.data.access_token;
 
   // ── Test: No open shift → 409 ──
   await test('Start wash without open shift → 409', async () => {
@@ -187,8 +180,12 @@ async function main() {
     r = await req('GET', '/api/v1/washes/queue', W1);
     assert(r.status === 200, `status ${r.status}`);
     assert(r.body.data.ready.length >= 1, 'at least 1 ready');
-    assert(r.body.data.ready[0].job_no === jobNo, 'correct job_no');
-    assert(typeof r.body.data.ready[0].stale === 'boolean', 'has stale boolean');
+    // The queue is branch-wide and ordered oldest-first by wash_done_at, so
+    // any ready wash left over from an earlier run sorts ahead of this one.
+    // Assert our wash is in the queue rather than that it is at index 0.
+    const mine = r.body.data.ready.find((w: any) => w.job_no === jobNo);
+    assert(!!mine, `job_no ${jobNo} not in ready queue`);
+    assert(typeof mine.stale === 'boolean', 'has stale boolean');
   });
 
   // ── Test: Settle walk-in (no token, with unverified_reason) ──
