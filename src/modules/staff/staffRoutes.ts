@@ -5,20 +5,11 @@ import { getPool } from '@/db';
 import { createAppError } from '@/middleware/errorHandler';
 import { authenticate } from '@/middleware/auth';
 import { requireRole, getOrgId, getBranchId } from '@/middleware/requireRole';
-import { generateTempPassword } from '@/utils/tempPassword';
-import { sendStaffTempPasswordEmail } from '@/utils/email';
 import { normalizeUgPhone, displayUgPhone } from '@/utils/sms';
 
 const router = Router();
 
 // authenticate is applied globally in app.ts
-
-// Role hierarchy: worker < manager < orgadmin < sysadmin
-const ROLE_RANK: Record<string, number> = {
-  worker: 1,
-  manager: 2,
-  orgadmin: 3,
-};
 
 // Validation schemas
 //
@@ -42,8 +33,6 @@ const updateStaffSchema = z.object({
   role: z.enum(['orgadmin', 'manager', 'worker']).optional(),
   branch_id: z.string().uuid().optional(),
 });
-
-const resetPasswordSchema = z.object({});
 
 const setPinSchema = z.object({
   pin: z.string().min(4).max(6),
@@ -286,104 +275,6 @@ router.patch('/:id', requireRole('orgadmin', 'manager'), async (req: Request, re
     );
 
     res.json({ ok: true, data: { message: 'Staff member updated' } });
-  } catch (err) {
-    next(err);
-  }
-});
-
-/**
- * POST /staff/:id/reset-password
- * Strictly-junior rule: can only reset someone of strictly lower rank
- */
-router.post('/:id/reset-password', requireRole('orgadmin', 'manager'), async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const orgId = getOrgId(req.actor!);
-    const pool = getPool();
-    const { id } = req.params;
-
-    // Get target
-    const targetResult = await pool.query(
-      'SELECT id, role, branch_id, full_name, username, email FROM staff_users WHERE id = $1 AND org_id = $2',
-      [id, orgId]
-    );
-
-    if (targetResult.rows.length === 0) {
-      next(createAppError(404, 'NOT_FOUND', 'Staff member not found'));
-      return;
-    }
-
-    const target = targetResult.rows[0];
-    const callerRank = ROLE_RANK[req.actor!.role!] || 0;
-    const targetRank = ROLE_RANK[target.role] || 0;
-
-    // Strictly-junior: target must be strictly lower rank
-    if (targetRank >= callerRank) {
-      // Audit the refused attempt
-      await pool.query(
-        `INSERT INTO audit_logs (org_id, actor_type, actor_id, action, entity, entity_id, "before")
-         VALUES ($1, 'staff', $2, 'staff.reset_password_refused', 'staff_users', $3, $4)`,
-        [orgId, req.actor!.sub, id, JSON.stringify({ target_role: target.role, reason: 'insufficient_rank' })]
-      );
-      next(createAppError(403, 'CANNOT_RESET_PEER_OR_SENIOR', 'Cannot reset password of peer or senior'));
-      return;
-    }
-
-    // Manager can only reset workers in own branch
-    if (req.actor!.role === 'manager' && target.branch_id !== req.actor!.branch_id) {
-      await pool.query(
-        `INSERT INTO audit_logs (org_id, actor_type, actor_id, action, entity, entity_id, "before")
-         VALUES ($1, 'staff', $2, 'staff.reset_password_refused', 'staff_users', $3, $4)`,
-        [orgId, req.actor!.sub, id, JSON.stringify({ target_role: target.role, reason: 'wrong_branch' })]
-      );
-      next(createAppError(403, 'CANNOT_RESET_PEER_OR_SENIOR', 'Cannot reset password of staff in another branch'));
-      return;
-    }
-
-    // Generate temp password
-    const tempPassword = generateTempPassword();
-    const passwordHash = await argon2.hash(tempPassword);
-
-    await pool.query(
-      'UPDATE staff_users SET password_hash = $1, must_change_password = true, updated_at = now() WHERE id = $2',
-      [passwordHash, id]
-    );
-
-    // Revoke all refresh tokens
-    await pool.query(
-      'UPDATE refresh_tokens SET revoked_at = now() WHERE owner_type = $1 AND owner_id = $2 AND revoked_at IS NULL',
-      ['staff', id]
-    );
-
-    // Audit
-    await pool.query(
-      `INSERT INTO audit_logs (org_id, actor_type, actor_id, action, entity, entity_id, "after")
-       VALUES ($1, 'staff', $2, 'staff.password_reset', 'staff_users', $3, $4)`,
-      [orgId, req.actor!.sub, id, JSON.stringify({ target_role: target.role })]
-    );
-
-    // Same reasoning as staff creation: the password has already been changed
-    // by this point. Throwing here would return a 500 while leaving the user
-    // locked out of an account whose new password nobody was ever shown.
-    let emailed = false;
-    if (target.email) {
-      try {
-        await sendStaffTempPasswordEmail(target.email, target.full_name, target.username, tempPassword, 'reset');
-        emailed = true;
-      } catch (mailErr) {
-        console.error(`[email] reset password to ${target.email} failed:`, mailErr);
-      }
-    }
-
-    res.json({
-      ok: true,
-      data: {
-        temp_password: tempPassword,
-        emailed,
-        message: emailed
-          ? 'Password reset. The temp password has also been emailed to them.'
-          : 'Password reset. Share the temp password directly. It will not be shown again.',
-      },
-    });
   } catch (err) {
     next(err);
   }

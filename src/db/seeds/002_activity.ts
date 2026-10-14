@@ -110,13 +110,6 @@ export async function seed(knex: Knex): Promise<void> {
   for (const [u, n] of kblNames) kblWorkers.push(await ensureWorker(u, n, kbl.id));
 
   // ── Clients ───────────────────────────────────────────────────────
-  const memberCode = () => {
-    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-    let c = 'MC-';
-    for (let i = 0; i < 6; i++) c += chars[Math.floor(Math.random() * chars.length)];
-    return c;
-  };
-
   const clientSpecs = [
     { username: 'peter_o',  name: 'Peter O.',    phone: '+256700123456' }, // already exists
     { username: 'mary_n',   name: 'Mary N.',     phone: '+256700123457' },
@@ -136,9 +129,9 @@ export async function seed(knex: Knex): Promise<void> {
     );
     if (!c) {
       c = await one(
-        `INSERT INTO clients (org_id, full_name, phone, member_code, phone_verified, username, email, email_verified, password_hash)
-         VALUES (?, ?, ?, ?, true, ?, ?, true, ?) RETURNING id, full_name`,
-        [orgId, spec.name, spec.phone, memberCode(), spec.username, `${spec.username}@example.com`, clientHash]
+        `INSERT INTO clients (org_id, full_name, phone, phone_verified, username, email, email_verified, password_hash)
+         VALUES (?, ?, ?, true, ?, ?, true, ?) RETURNING id, full_name`,
+        [orgId, spec.name, spec.phone, spec.username, `${spec.username}@example.com`, clientHash]
       );
       console.log(`  + client: ${spec.username} / Client123!`);
     }
@@ -295,7 +288,7 @@ export async function seed(knex: Knex): Promise<void> {
           const vc = pick(vcs);
           const svc = pick(svcs);
           const price = priceOf(svc.id, vc.id, crew.branch.id);
-          if (price == null) continue;            // Pickup/Half wash has no price by design
+          if (price == null) continue;            // Pickup/Heavy vehicle has no price by design
 
           const startAt = new Date(openAt);
           startAt.setMinutes(startAt.getMinutes() + 25 + i * (40 + Math.floor(rnd() * 25)));

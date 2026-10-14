@@ -21,8 +21,15 @@
 
 const BASE = process.env.TEST_BASE || 'http://localhost:3456/api/v1';
 
-/** The seeded staff accounts, by the username the old suites used. */
-export const STAFF_PHONES: Record<string, string> = {
+/**
+ * The seeded accounts, by the username the old suites used.
+ *
+ * Includes the platform admin: `/auth/phone/verify` resolves all three actor
+ * types (platform → staff → client) behind one endpoint, so the sysadmin signs
+ * in the same way and needs no separate helper.
+ */
+export const ACCOUNT_PHONES: Record<string, string> = {
+  sysadmin: '+256700200000', // platform admin
   orgadmin: '+256700200001',
   grace: '+256700200002',   // manager
   joseph: '+256700200003',  // worker, NTD
@@ -89,15 +96,15 @@ export async function signInByPhone(phone: string): Promise<string> {
 }
 
 /**
- * Sign in a seeded staff account by the username the suites already use.
+ * Sign in a seeded account by the username the suites already use.
  * Drop-in for the old `/auth/staff/login` + change-password dance.
  */
 export async function signInAs(username: string): Promise<string> {
-  const phone = STAFF_PHONES[username];
+  const phone = ACCOUNT_PHONES[username];
   if (!phone) {
     throw new Error(
-      `No phone mapped for staff username "${username}". Add it to ` +
-      `STAFF_PHONES in tests/helpers/auth.ts.`
+      `No phone mapped for account "${username}". Add it to ` +
+      `ACCOUNT_PHONES in tests/helpers/auth.ts.`
     );
   }
   return signInByPhone(phone);

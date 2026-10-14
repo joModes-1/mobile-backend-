@@ -19,9 +19,11 @@
     "test:phase5": "ts-node -r tsconfig-paths/register tests/phase5-test.ts",
     "test:phase6": "ts-node -r tsconfig-paths/register tests/phase6-test.ts",
     "test:phase7": "ts-node -r tsconfig-paths/register tests/phase7-test.ts",
-    "test:all": "npm run test:phase2 && npm run test:phase3 && npm run test:phase4 && npm run test:phase5 && npm run test:phase6 && npm run test:phase7 && npm run test:phase11 && npm run test:phase12 && npm run test:e2e",
+    "test:all": "npm run test:phase2 && npm run test:phase3 && npm run test:phase4 && npm run test:phase5 && npm run test:phase6 && npm run test:phase7 && npm run test:phase11 && npm run test:phase12 && npm run test:phase13 && npm run test:phase14 && npm run test:e2e",
     "test:phase11": "ts-node -r tsconfig-paths/register tests/phase11-test.ts",
-    "test:phase12": "ts-node -r tsconfig-paths/register tests/phase12-test.ts"
+    "test:phase12": "ts-node -r tsconfig-paths/register tests/phase12-test.ts",
+    "test:phase13": "ts-node -r tsconfig-paths/register tests/phase13-test.ts",
+    "test:phase14": "ts-node -r tsconfig-paths/register tests/phase14-test.ts"
   },
   "dependencies": {
     "@types/helmet": "^0.0.48",
@@ -34,7 +36,6 @@
     "jsonwebtoken": "^9.0.2",
     "knex": "^3.1.0",
     "node-cron": "^3.0.3",
-    "nodemailer": "^9.0.6",
     "pg": "^8.13.1",
     "pino": "^9.6.0",
     "pino-pretty": "^13.0.0",
@@ -48,7 +49,6 @@
     "@types/jsonwebtoken": "^9.0.7",
     "@types/node": "^22.12.0",
     "@types/node-cron": "^3.0.11",
-    "@types/nodemailer": "^8.0.1",
     "@types/pg": "^8.23.1",
     "@types/uuid": "^10.0.0",
     "jest": "^29.7.0",

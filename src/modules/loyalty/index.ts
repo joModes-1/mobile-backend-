@@ -216,3 +216,80 @@ export async function processSettlement(
 
   return { account, rewardGranted };
 }
+
+// ─── "Wash 2 cars for the price of 1" promo ────────────────────────────
+//
+// Sits beside the credit mechanism but is deliberately NOT a credit: the
+// client paid full price for wash #1, so the reward is already bought — it
+// must not consume free_wash_credits, and it must not earn a wash_count
+// stamp either (the paid wash #1 already earned its own stamp at its own
+// settlement; counting the free wash too would be two stamps for one
+// payment).
+
+/**
+ * Does this client have the offer armed (grabbed, paid wash settled) but
+ * not yet spent? Called inside the booking AND settle transactions with
+ * FOR UPDATE, so concurrent bookings race safely on the row lock.
+ */
+export async function hasArmedPromo(
+  pool: any,
+  clientId: string,
+  promoKey: string
+): Promise<boolean> {
+  const result = await pool.query(
+    `SELECT id FROM promo_redemptions
+      WHERE client_id = $1 AND promo_key = $2 AND status = 'armed'
+      FOR UPDATE`,
+    [clientId, promoKey]
+  );
+  return result.rows.length > 0;
+}
+
+/**
+ * Redeem the client's armed promo at settlement of the FREE wash.
+ *
+ * Marks the redemption row 'used' and writes the ledger entry. The caller
+ * (settleWash) checks hasArmedPromo BEFORE settling — a wash flagged
+ * is_redemption with no armed promo behind it still goes down the normal
+ * credit path, never here.
+ *
+ * Returns the client's (unchanged) loyalty account, mirroring
+ * processSettlement's shape so the settle handler has one shape to render.
+ */
+export async function redeemPromo(
+  pool: any,
+  clientId: string,
+  washId: string,
+  settlerId: string
+): Promise<{ account: any; rewardGranted: boolean }> {
+  // Row already locked by the caller's hasArmedPromo() FOR UPDATE inside
+  // this same transaction.
+  const result = await pool.query(
+    `UPDATE promo_redemptions
+        SET status = 'used', free_wash_id = $2, used_at = now()
+      WHERE client_id = $1 AND status = 'armed'
+      RETURNING id, promo_key`,
+    [clientId, washId]
+  );
+  if (result.rows.length === 0) {
+    // Cannot happen if the caller checked hasArmedPromo in the same
+    // transaction — defensive only.
+    throw { status: 422, code: 'NO_PROMO', message: 'No promo offer to redeem' } as any;
+  }
+
+  const account = await lockAccount(pool, clientId);
+
+  await writeLedgerEntry(pool, {
+    clientId,
+    washId,
+    entryType: 'promo_redeem',
+    washDelta: 0,
+    creditDelta: 0,
+    washCountAfter: account ? account.wash_count : 0,
+    creditsAfter: account ? account.free_wash_credits : 0,
+    reason: `promo:${result.rows[0].promo_key}`,
+    createdBy: settlerId,
+  });
+
+  return { account, rewardGranted: false };
+}

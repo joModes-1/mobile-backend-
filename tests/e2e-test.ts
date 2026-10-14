@@ -107,13 +107,12 @@ async function main() {
 
   await act('Act 1 — Provisioning', [
     {
-      name: 'Sysadmin login works',
+      name: 'Sysadmin signs in by phone',
       fn: async () => {
-        const r = await req('POST', '/api/v1/auth/platform/login', undefined, {
-          email: 'admin@carwash.com', password: 'admin123',
-        });
-        assert(r.status === 200, `status ${r.status}`);
-        state.sysadmin = r.body.data.access_token;
+        // Password login for platform admins was removed; the sysadmin signs
+        // in with phone + OTP through the shared helper, like every other role.
+        state.sysadmin = await signInAs('sysadmin');
+        assert(!!state.sysadmin, 'got a token');
       },
     },
     {
@@ -196,9 +195,9 @@ async function main() {
       fn: async () => {
         const r = await req('GET', '/api/v1/services', state.orgadmin);
         assert(r.status === 200, `status ${r.status}`);
-        state.fullWashId = r.body.data.find((s: any) => s.name === 'Full wash')?.id;
-        state.halfWashId = r.body.data.find((s: any) => s.name === 'Half wash')?.id;
-        state.engineId = r.body.data.find((s: any) => s.name === 'Engine')?.id;
+        state.fullWashId = r.body.data.find((s: any) => s.name === 'Bikes')?.id;
+        state.halfWashId = r.body.data.find((s: any) => s.name === 'Heavy vehicle')?.id;
+        state.engineId = r.body.data.find((s: any) => s.name === 'Engine wash')?.id;
       },
     },
     {
@@ -221,7 +220,7 @@ async function main() {
         const vcs = r.body.data.vehicle_classes;
         const saloon = vcs.find((vc: any) => vc.name === 'Saloon');
         assert(saloon, 'Saloon found');
-        const fullWash = saloon.services.find((s: any) => s.name === 'Full wash');
+        const fullWash = saloon.services.find((s: any) => s.name === 'Bikes');
         assert(fullWash, 'Full wash found');
         // NTD override for Saloon Full = 25000
         assert(Number(fullWash.price_ugx) === 25000, `price ${fullWash.price_ugx}`);

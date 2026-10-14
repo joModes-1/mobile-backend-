@@ -60,7 +60,7 @@ async function main() {
   check('Duplicate vehicle class (409)', dupVC.error?.code === 'DUPLICATE_NAME');
 
   // 4. Duplicate service -> 409
-  const dupSvc = await api('POST', '/api/v1/services', { name: 'Full wash' }, oaToken);
+  const dupSvc = await api('POST', '/api/v1/services', { name: 'Bikes' }, oaToken);
   check('Duplicate service (409)', dupSvc.error?.code === 'DUPLICATE_NAME');
 
   console.log('\n=== PRICE MATRIX TESTS ===');
@@ -75,7 +75,7 @@ async function main() {
   // 6. Branch override wins over org default
   const ntdSuvFull = matrix.data.matrix.find((p: any) => {
     const vc = matrix.data.vehicle_classes.find((v: any) => v.name === 'SUV');
-    const svc = matrix.data.services.find((s: any) => s.name === 'Full wash');
+    const svc = matrix.data.services.find((s: any) => s.name === 'Bikes');
     return p.vehicle_class_id === vc?.id && p.service_id === svc?.id;
   });
   check('Branch override present for SUV at NTD', ntdSuvFull?.source === 'branch_override');
@@ -85,7 +85,7 @@ async function main() {
   const kblMatrix = await api('GET', '/api/v1/prices?branch_id=' + kblId, null, oaToken);
   const kblSuvFull = kblMatrix.data.matrix.find((p: any) => {
     const vc = kblMatrix.data.vehicle_classes.find((v: any) => v.name === 'SUV');
-    const svc = kblMatrix.data.services.find((s: any) => s.name === 'Full wash');
+    const svc = kblMatrix.data.services.find((s: any) => s.name === 'Bikes');
     return p.vehicle_class_id === vc?.id && p.service_id === svc?.id;
   });
   check('No override for KBL -> uses org default', kblSuvFull?.source === 'org_default');
@@ -97,7 +97,7 @@ async function main() {
   check('Effective prices returned', effective.ok && effective.data.vehicle_classes.length === 5);
   const effSuv = effective.data.vehicle_classes.find((vc: any) => vc.name === 'SUV');
   check('Effective has every service nested', effSuv?.services?.length === baselineServiceCount);
-  const effSuvFull = effSuv?.services.find((s: any) => s.name === 'Full wash');
+  const effSuvFull = effSuv?.services.find((s: any) => s.name === 'Bikes');
   check('Effective SUV Full Wash has_price=true', effSuvFull?.has_price === true);
   // Assert the two endpoints agree rather than pinning a literal: the price
   // is seed data that later suites (and this one) legitimately overwrite.
@@ -108,7 +108,7 @@ async function main() {
 
   // 9. PUT /prices orgwide upsert
   const saloonClass = vcs.data.find((v: any) => v.name === 'Saloon');
-  const halfWash = svcs.data.find((s: any) => s.name === 'Half wash');
+  const halfWash = svcs.data.find((s: any) => s.name === 'Heavy vehicle');
   const upsert = await api('PUT', '/api/v1/prices', { service_id: halfWash.id, vehicle_class_id: saloonClass.id, price_ugx: 13000 }, oaToken);
   check('Orgadmin upserts org-wide price', upsert.ok);
 

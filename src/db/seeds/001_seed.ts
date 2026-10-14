@@ -140,20 +140,13 @@ export async function seed(knex: Knex): Promise<void> {
   await ensureStaff('musa', 'Musa K.', 'worker', branch1Id, 'musa@democarwash.com', 'Worker123!', managerId, '+256700200004');
 
   // ── Client ────────────────────────────────────────────────────────
-  function memberCode(): string {
-    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-    let code = 'MC-';
-    for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
-    return code;
-  }
-
   await ensure(
     'clients',
     { sql: 'org_id = ? AND lower(username) = lower(?)', params: [orgId, 'peter_o'] },
     {
-      columns: 'org_id, full_name, phone, member_code, phone_verified, username, email, email_verified, password_hash',
-      values: '?, ?, ?, ?, true, ?, ?, true, ?',
-      params: [orgId, 'Peter O.', '+256700200099', memberCode(), 'peter_o', 'peter.o@example.com', await argon2.hash('Client123!')],
+      columns: 'org_id, full_name, phone, phone_verified, username, email, email_verified, password_hash',
+      values: '?, ?, ?, true, ?, ?, true, ?',
+      params: [orgId, 'Peter O.', '+256700200099', 'peter_o', 'peter.o@example.com', await argon2.hash('Client123!')],
     },
     'client: peter_o / Client123! / +256700200099'
   );
@@ -188,10 +181,10 @@ export async function seed(knex: Knex): Promise<void> {
   const orgHasDefault = existingDefault.rows.length > 0;
 
   const services = [
-    { name: 'Full wash', is_default: true, earns_point: true },
-    { name: 'Half wash', is_default: false, earns_point: true },
-    { name: 'Interior only', is_default: false, earns_point: true },
-    { name: 'Engine', is_default: false, earns_point: false },
+    { name: 'Bikes', is_default: true, earns_point: true },
+    { name: 'Heavy vehicle', is_default: false, earns_point: true },
+    { name: 'Interior detailing', is_default: false, earns_point: true },
+    { name: 'Engine wash', is_default: false, earns_point: false },
   ];
   const svcIds: Record<string, string> = {};
   for (const svc of services) {
@@ -209,10 +202,10 @@ export async function seed(knex: Knex): Promise<void> {
 
   // ── Prices ────────────────────────────────────────────────────────
   const priceMatrix: Record<string, Record<string, number>> = {
-    'Full wash':     { Saloon: 20000, SUV: 30000, Pickup: 35000, Van: 25000, Truck: 35000 },
-    'Half wash':     { Saloon: 12000, SUV: 15000, Van: 15000, Truck: 20000 },
-    'Interior only': { Saloon: 15000, SUV: 18000, Pickup: 20000, Van: 18000, Truck: 22000 },
-    'Engine':        { Saloon: 8000,  SUV: 10000, Pickup: 12000, Van: 10000, Truck: 15000 },
+    'Bikes':      { Saloon: 20000, SUV: 30000, Pickup: 35000, Van: 25000, Truck: 35000 },
+    'Heavy vehicle': { Saloon: 12000, SUV: 15000, Van: 15000, Truck: 20000 },
+    'Interior detailing': { Saloon: 15000, SUV: 18000, Pickup: 20000, Van: 18000, Truck: 22000 },
+    'Engine wash':         { Saloon: 8000,  SUV: 10000, Pickup: 12000, Van: 10000, Truck: 15000 },
   };
   for (const [svcName, vcPrices] of Object.entries(priceMatrix)) {
     for (const [vcName, price] of Object.entries(vcPrices)) {
@@ -234,8 +227,8 @@ export async function seed(knex: Knex): Promise<void> {
 
   // Ntinda-specific overrides
   const overrides: Array<[string, string, number]> = [
-    ['Full wash', 'Saloon', 25000],
-    ['Full wash', 'SUV', 35000],
+    ['Bikes', 'Saloon', 25000],
+    ['Bikes', 'SUV', 35000],
   ];
   for (const [svcName, vcName, price] of overrides) {
     await ensure(
@@ -296,6 +289,27 @@ export async function seed(knex: Knex): Promise<void> {
     'orgadmin: shineadmin / Orgadmin123! / +256700200005'
   );
   await knex.raw(`UPDATE staff_users SET phone = ? WHERE id = ?`, ['+256700200005', shineAdminId]);
+
+  // ── Branch coordinates (for the nearby-branch picker) ────────────
+  // Backfill-only: an existing branch keeps whatever coordinates it
+  // already has (including a deliberate correction made via the app),
+  // exactly like the phone backfill above. Real Kampala-area points,
+  // far enough apart that the /me/branches/nearby distance ordering is
+  // testable — the numbers are the point, not precise door positions.
+  const branchCoords: Array<{ code: string; lat: number; lng: number }> = [
+    { code: 'NTD', lat: 0.348232, lng: 32.618631 }, // Ntinda
+    { code: 'KBL', lat: 0.296201, lng: 32.609217 }, // Kabalagala
+    { code: 'SHN', lat: 0.332460, lng: 32.570000 }, // near Kasangati road
+  ];
+  for (const { code, lat, lng } of branchCoords) {
+    await knex.raw(
+      `UPDATE branches SET latitude = ?, longitude = ?
+        WHERE upper(code) = upper(?)
+          AND latitude IS NULL AND longitude IS NULL`,
+      [lat, lng, code]
+    );
+  }
+  console.log('  branch coordinates: backfilled any that were missing.');
 
   const shineWorkerId = await ensure(
     'staff_users',

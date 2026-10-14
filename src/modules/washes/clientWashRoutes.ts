@@ -4,7 +4,14 @@ import { getPool } from '@/db';
 import { createAppError } from '@/middleware/errorHandler';
 import { resolvePrice } from '@/modules/pricing/resolvePrice';
 import { notify } from '@/modules/notify';
-import { bumpJobNo } from '@/modules/washes/washRoutes';
+import { bumpJobNo, tryAutoAssign } from '@/modules/washes/washRoutes';
+import { generateReceiptNo } from '@/utils/receiptNo';
+
+// The one promo the platform ships. Constant rather than config: there is a
+// single offer on the home screen, and the promo_redemptions.promo_key
+// DEFAULT matches it, so a rename would be a migration, not a settings
+// flip.
+export const PROMO_KEY = 'wash2_price1';
 
 const router = Router();
 
@@ -23,8 +30,8 @@ router.get('/active', async (req: Request, res: Response, next: NextFunction) =>
       // 'requested' is included so a client sees their own booking on this
       // screen from the moment they confirm it — before this, a client had
       // nothing to poll between tapping "book" and a worker accepting.
-      `SELECT w.id, w.job_no, w.status, w.quoted_amount_ugx, w.started_at,
-              w.requested_at, w.is_redemption,
+      `SELECT w.id, w.job_no, w.receipt_no, w.status, w.quoted_amount_ugx, w.started_at,
+              w.requested_at, w.is_redemption, w.declared_payment_method,
               vc.name as vehicle_class_name, svc.name as service_name,
               b.name as branch_name
        FROM washes w
@@ -53,17 +60,66 @@ router.get('/history', async (req: Request, res: Response, next: NextFunction) =
     const pool = getPool();
     const result = await pool.query(
       `SELECT w.id, w.job_no, w.status, w.amount_ugx, w.quoted_amount_ugx,
-              w.is_redemption, w.started_at, w.settled_at, w.receipt_no,
+              w.is_redemption, w.started_at, w.settled_at, w.requested_at, w.receipt_no,
               vc.name as vehicle_class_name, svc.name as service_name
        FROM washes w
        JOIN vehicle_classes vc ON w.vehicle_class_id = vc.id
        JOIN services svc ON w.service_id = svc.id
        WHERE w.client_id = $1
-       ORDER BY w.started_at DESC LIMIT 50`,
+       ORDER BY COALESCE(w.started_at, w.requested_at, w.created_at) DESC LIMIT 50`,
       [req.actor.sub]
     );
 
     res.json({ ok: true, data: result.rows });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /me/washes/promo — the home screen's promo card state
+//
+// The client's own one-time offer, as the card should render it:
+//  - { used: true }                      → the offer is spent entirely.
+//  - { used: false, active_wash: true }  → grabbed, paid wash still running.
+//  - { used: false, active_wash: false } → grabbed, next wash is free.
+//  - { used: false, available: true }    → not yet grabbed.
+// Anything that exists as a row means the client grabbed it — status moves
+// armed → used, never backwards — and the UNIQUE(client_id) is what makes
+// the offer strictly one-time per client, enforced by the database itself.
+router.get('/promo', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    if (!req.actor || req.actor.type !== 'client') {
+      next(createAppError(403, 'FORBIDDEN', 'Client access required'));
+      return;
+    }
+
+    const pool = getPool();
+    const result = await pool.query(
+      `SELECT r.status, r.free_wash_id, r.created_at,
+              (w.id IS NOT NULL) AS started_wash_active
+         FROM promo_redemptions r
+         LEFT JOIN washes w
+           ON w.id = r.started_wash_id
+          AND w.status IN ('requested', 'in_progress', 'ready')
+        WHERE r.client_id = $1 AND r.promo_key = $2`,
+      [req.actor.sub, PROMO_KEY]
+    );
+
+    const row = result.rows[0];
+    if (!row) {
+      res.json({ ok: true, data: { promo_key: PROMO_KEY, used: false, available: true } });
+      return;
+    }
+
+    res.json({
+      ok: true,
+      data: {
+        promo_key: PROMO_KEY,
+        used: row.status === 'used',
+        available: false,
+        active_wash: row.status === 'armed' && row.started_wash_active,
+      },
+    });
   } catch (err) {
     next(err);
   }
@@ -177,6 +233,13 @@ const bookSchema = z.object({
   plate: z.string().optional(),
   vehicle_color: z.string().max(40).optional(),
   use_free_wash: z.boolean().optional().default(false),
+  // Grabbed "wash 2 for the price of 1": this booking is the PAID first
+  // wash of the offer, which arms the client's next free one at settlement.
+  use_promo: z.boolean().optional().default(false),
+  // The armed free wash itself — booked at zero cost. Server-side promo
+  // state is the source of truth; this flag only tells the server the
+  // client INTENDS to spend it now.
+  use_promo_free: z.boolean().optional().default(false),
   declared_payment_method: z.enum(['cash', 'mtn', 'airtel']).optional(),
   declared_payment_phone: z.string().max(20).optional(),
 });
@@ -223,15 +286,19 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
     }
     const orgId = branch.org_id;
 
-    // A client should not have two simultaneous pending requests — a double
-    // tap of "book" must not queue a second car nobody is waiting for.
+    // A client should not have two simultaneous active washes — one car at
+    // a time. This used to check only status='requested' (a double-tap of
+    // "book" queuing a second unclaimed request), but once a booking can be
+    // auto-assigned straight to 'in_progress' that check no longer covers
+    // the case that actually matters: a client with a wash already being
+    // washed booking a second one before the first is even done.
     const already = await client.query(
-      `SELECT id FROM washes WHERE client_id = $1 AND status = 'requested'`,
+      `SELECT id FROM washes WHERE client_id = $1 AND status IN ('requested', 'in_progress', 'ready')`,
       [clientId]
     );
     if (already.rows.length > 0) {
       await client.query('ROLLBACK');
-      next(createAppError(409, 'ALREADY_REQUESTED', 'You already have a wash waiting to be accepted'));
+      next(createAppError(409, 'ALREADY_REQUESTED', 'You already have a wash in progress'));
       return;
     }
 
@@ -294,10 +361,56 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
       return;
     }
 
+    // ── Promo state resolution ──
+    // The grabbed-but-unspent offer is a fact about the CLIENT (a row in
+    // promo_redemptions), not about what the request body claims, so the
+    // row itself is read (and locked) here whenever either promo flag is
+    // sent. The body flags only ever express intent; a stale client can
+    // never conjure a discount the database does not owe.
+    const promoRow = body.use_promo || body.use_promo_free
+      ? await client.query(
+          `SELECT id, status FROM promo_redemptions
+            WHERE client_id = $1 AND promo_key = $2
+            FOR UPDATE`,
+          [clientId, PROMO_KEY]
+        )
+      : null;
+    // A query that RAN but found no row (fresh client) is not the same as
+    // the query not being needed at all — both mean "the offer is ungrabbed".
+    const promoExists = !!promoRow && promoRow.rows.length > 0;
+    const armed = promoExists && promoRow!.rows[0].status === 'armed';
+    const isPromoStart = !!body.use_promo && !promoExists;
+    const isPromoFree = !!body.use_promo_free && armed;
+
+    // Grabbing with any row already in place — armed or used — is a clean
+    // conflict, never a UNIQUE violation bubbling up as a 500. The offer is
+    // one-time per client, forever: a used row is never re-armed.
+    if (body.use_promo && !isPromoStart) {
+      await client.query('ROLLBACK');
+      next(createAppError(409, 'PROMO_CONFLICT', 'This offer has already been claimed on your account'));
+      return;
+    }
+
+    // The client believes their next wash is free but the armed row is gone
+    // (used from another device, or unwound by a cancellation) — fail loudly
+    // rather than silently booking a wash at full price they expected to be
+    // free. The client app offers a normal rebook on this code.
+    if (body.use_promo_free && !armed) {
+      await client.query('ROLLBACK');
+      next(createAppError(409, 'PROMO_UNAVAILABLE', 'Your free promo wash is not available — it may have been used already'));
+      return;
+    }
+
     // Free-wash check — same "check credits, don't consume yet" rule as the
     // worker-initiated flow; the credit is only actually spent at settlement.
+    // Mutually exclusive with the promo by schema contract: is_promo_free
+    // (an already-paid reward) and use_free_wash (a banked credit) are never
+    // both sent, and if a client sends both anyway the promo wins — a reward
+    // the client has already paid for must not silently burn a credit too.
     let isRedemption = false;
-    if (body.use_free_wash) {
+    if (isPromoFree) {
+      isRedemption = true;
+    } else if (body.use_free_wash) {
       const acct = await client.query(
         `SELECT free_wash_credits FROM loyalty_accounts WHERE client_id = $1`,
         [clientId]
@@ -318,9 +431,9 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
          plate, vehicle_color, service_id, vehicle_class_id, price_id,
          quoted_amount_ugx, is_redemption, earns_point,
          job_no, status, origin, start_verified, requested_at, started_date,
-         declared_payment_method, declared_payment_phone
+         declared_payment_method, declared_payment_phone, promo_key
        ) VALUES ($1,$2,$3,'client_booking',$4,$5,$6,$7,$8,$9,$10,$11,$12,
-                 'requested','client',true, now(), CURRENT_DATE, $13, $14)
+                 'requested','client',true, now(), CURRENT_DATE, $13, $14, $15)
        RETURNING *`,
       [
         orgId, body.branch_id, clientId,
@@ -329,26 +442,71 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
         price.price_ugx, isRedemption, service.earns_point,
         jobNo,
         body.declared_payment_method || null, body.declared_payment_phone || null,
+        // The offer's washes carry the key so app copy can distinguish a
+        // promo reward from a credit redemption; NULL for plain bookings.
+        (isPromoStart || isPromoFree) ? PROMO_KEY : null,
       ]
     );
     const wash = washResult.rows[0];
 
+    // Arming happens HERE, inside the booking transaction: the offer is
+    // only armed by a booking that reached this point having passed the
+    // price/full-price checks above. The insertion happens after the wash
+    // row so started_wash_id can point at it. The armed reward is granted
+    // once the paid wash settles (settleWash → markPromoStarted); the row
+    // already existing now means a grab can never race itself.
+    let promoRedemptionId: string | null = null;
+    if (isPromoStart) {
+      // UNIQUE(client_id) is the one-time guarantee: a second grab (or a
+      // double-tap) violates the constraint and the whole booking fails.
+      const promoInsert = await client.query(
+        `INSERT INTO promo_redemptions (client_id, org_id, started_wash_id)
+         VALUES ($1, $2, $3)
+         RETURNING id`,
+        [clientId, orgId, wash.id]
+      );
+      promoRedemptionId = promoInsert.rows[0].id;
+    } else if (isPromoFree) {
+      // Point the armed offer at the free wash it is being spent on now.
+      // Status stays 'armed' — only settlement flips it to 'used', so a
+      // cancelled free wash leaves the reward intact.
+      await client.query(
+        `UPDATE promo_redemptions
+            SET free_wash_id = $2
+          WHERE client_id = $1 AND status = 'armed'`,
+        [clientId, wash.id]
+      );
+    }
+
     await client.query('COMMIT');
 
-    // Every worker with an open shift at this branch can accept it — nobody
-    // is attached yet, so there is no single recipient the way settled/ready
-    // events have one.
-    const openShiftWorkers = await pool.query(
-      `SELECT DISTINCT worker_id FROM shifts WHERE branch_id = $1 AND status = 'open'`,
-      [body.branch_id]
-    );
-    for (const row of openShiftWorkers.rows) {
-      notify('staff', row.worker_id, 'wash_requested', {
-        wash_id: wash.id,
-        job_no: jobNo,
-        vehicle_class_name: vehicleClass.name,
-        service_name: service.name,
-      });
+    // Self-service model: a worker is picked automatically the moment the
+    // client's booking commits, not by anyone tapping "Accept" — see
+    // tryAutoAssign()'s own doc comment. Deliberately AFTER commit, in its
+    // own statement: the booking must exist regardless of whether a free
+    // worker was found, and a failed/slow auto-assign must never roll back
+    // a booking that already succeeded from the client's point of view.
+    let finalStatus = 'requested';
+    const assigned = await tryAutoAssign(pool, wash.id, body.branch_id);
+    if (assigned) {
+      finalStatus = 'in_progress';
+      notify('client', clientId, 'wash_started', { wash_id: wash.id, job_no: jobNo });
+    } else {
+      // Nobody free right now — fall back to the request list every worker
+      // at the branch can see and manually accept from once they finish
+      // their current car.
+      const openShiftWorkers = await pool.query(
+        `SELECT DISTINCT worker_id FROM shifts WHERE branch_id = $1 AND status = 'open'`,
+        [body.branch_id]
+      );
+      for (const row of openShiftWorkers.rows) {
+        notify('staff', row.worker_id, 'wash_requested', {
+          wash_id: wash.id,
+          job_no: jobNo,
+          vehicle_class_name: vehicleClass.name,
+          service_name: service.name,
+        });
+      }
     }
 
     res.status(201).json({
@@ -356,11 +514,13 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
       data: {
         wash_id: wash.id,
         job_no: jobNo,
-        status: 'requested',
+        status: finalStatus,
         quoted_amount_ugx: Number(wash.quoted_amount_ugx),
         service_name: service.name,
         vehicle_class_name: vehicleClass.name,
         is_redemption: isRedemption,
+        is_promo_free: isPromoFree,
+        promo_earned: isPromoStart,
       },
     });
   } catch (err) {
@@ -397,18 +557,29 @@ router.post('/:id/payment-intent', async (req: Request, res: Response, next: Nex
 
   try {
     const pool = getPool();
-    const result = await pool.query(
-      `UPDATE washes
-          SET declared_payment_method = $1, declared_payment_phone = $2, updated_at = now()
-        WHERE id = $3 AND client_id = $4 AND status = 'ready'
-        RETURNING id`,
-      [body.method, body.phone || null, req.params.id, req.actor.sub]
-    );
-    if (result.rows.length === 0) {
-      next(createAppError(404, 'NOT_FOUND', 'Wash not found, not yours, or not ready for payment'));
-      return;
+    // receipt_no is kept if already set (re-declaring a method keeps the
+    // same receipt). A fresh one can collide with the unique index in
+    // theory, so retry a few times on 23505 before giving up.
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const result = await pool.query(
+          `UPDATE washes
+              SET declared_payment_method = $1, declared_payment_phone = $2,
+                  receipt_no = COALESCE(receipt_no, $5), updated_at = now()
+            WHERE id = $3 AND client_id = $4 AND status IN ('requested', 'in_progress', 'ready')
+            RETURNING id, receipt_no`,
+          [body.method, body.phone || null, req.params.id, req.actor.sub, generateReceiptNo()]
+        );
+        if (result.rows.length === 0) {
+          next(createAppError(404, 'NOT_FOUND', 'Wash not found, not yours, or already closed'));
+          return;
+        }
+        res.json({ ok: true, data: { id: result.rows[0].id, receipt_no: result.rows[0].receipt_no } });
+        return;
+      } catch (err: any) {
+        if (err?.code !== '23505' || attempt === 4) throw err;
+      }
     }
-    res.json({ ok: true, data: { id: result.rows[0].id } });
   } catch (err) {
     next(err);
   }
@@ -439,6 +610,17 @@ router.post('/:id/cancel-request', async (req: Request, res: Response, next: Nex
       next(createAppError(409, 'BAD_STATE', 'This booking can no longer be cancelled — it may already have been accepted'));
       return;
     }
+
+    // Same promo unwinding as the staff cancel route: the paid wash of a
+    // grab is gone before anyone ever worked on it, so the armed row must
+    // not survive — the client must be able to grab again, and an armed row
+    // whose paid wash never settled must never be spendable as a free wash.
+    await pool.query(
+      `DELETE FROM promo_redemptions
+        WHERE started_wash_id = $1 AND status = 'armed' AND free_wash_id IS NULL`,
+      [req.params.id]
+    );
+
     res.json({ ok: true, data: { id: result.rows[0].id } });
   } catch (err) {
     next(err);
@@ -508,35 +690,8 @@ router.get('/loyalty/ledger', async (req: Request, res: Response, next: NextFunc
   }
 });
 
-// GET /me/qr — client's static member_code
-router.get('/qr', async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    if (!req.actor || req.actor.type !== 'client') {
-      next(createAppError(403, 'FORBIDDEN', 'Client access required'));
-      return;
-    }
-
-    const pool = getPool();
-    const result = await pool.query(
-      `SELECT member_code, full_name FROM clients WHERE id = $1`,
-      [req.actor.sub]
-    );
-
-    if (result.rows.length === 0) {
-      next(createAppError(404, 'NOT_FOUND', 'Client not found'));
-      return;
-    }
-
-    res.json({
-      ok: true,
-      data: {
-        member_code: result.rows[0].member_code,
-        name: result.rows[0].full_name,
-      },
-    });
-  } catch (err) {
-    next(err);
-  }
-});
+// GET /me/qr was removed along with the member code. It existed so a client
+// could show their own QR for a worker to scan; booking is self-service now
+// (the client scans the branch's wall QR instead), so nothing consumed it.
 
 export default router;

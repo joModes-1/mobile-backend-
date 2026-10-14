@@ -2,11 +2,14 @@ import { Request, Response, NextFunction } from 'express';
 import { getPool } from '@/db';
 import { createAppError } from '@/middleware/errorHandler';
 
-// Routes that are allowed even when must_change_password is true
+// Routes that are allowed even when must_change_password is true.
+//
+// The three change-password paths that used to be listed here are gone with
+// the password routes themselves. This middleware is now effectively a
+// no-op — `must_change_password` is never set true by anything any more —
+// but it is left in place because it still gates every mounted router and
+// removing it is a 15-call-site change with no functional benefit.
 const ALLOWED_PATHS = [
-  '/api/v1/auth/staff/change-password',
-  '/api/v1/auth/platform/change-password',
-  '/api/v1/auth/client/change-password',
   '/api/v1/me',
   '/api/v1/auth/logout',
   '/api/v1/auth/platform/logout',

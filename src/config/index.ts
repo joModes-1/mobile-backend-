@@ -11,26 +11,13 @@ const envSchema = z.object({
   SEED_SYSADMIN_EMAIL: z.string().email(),
   SEED_SYSADMIN_PASSWORD: z.string().min(6),
   PORT: z.coerce.number().default(3000),
-  SMTP_HOST: z.string().optional(),
-  SMTP_PORT: z.coerce.number().default(587),
-  // NOT z.coerce.boolean(): that applies JS truthiness, under which the
-  // string "false" is true — so SMTP_SECURE=false switched TLS ON and the
-  // handshake failed against plaintext port 587 with "wrong version number".
-  // Parse the text as text.
-  SMTP_SECURE: z
-    .enum(['true', 'false', '1', '0', ''])
-    .default('false')
-    .transform((v) => v === 'true' || v === '1'),
-  SMTP_USER: z.string().optional(),
-  SMTP_PASS: z.string().optional(),
-  EMAIL_FROM: z.string().default('Car Wash Loyalty <no-reply@carwash.local>'),
-  // Where in-app issue reports are emailed. Optional: with no value the
-  // report is still saved and visible in the app, it just is not emailed —
-  // support must not break because SMTP has not been set up yet.
-  SUPPORT_EMAIL: z.string().optional(),
+
+  // All SMTP / email configuration was removed from the platform — no email
+  // is sent from anywhere any more (auth codes go by SMS; issue reports save
+  // in-app and are not emailed). Do not re-add these without a caller.
 
   // Africa's Talking, for SMS verification codes. Both optional: without
-  // them SMS is simply off and the app falls back to email signup.
+  // them SMS is simply off and phone sign-up cannot complete.
   //
   // Named AFRICASTALKING_USERNAME rather than USERNAME on purpose — USERNAME
   // is a built-in Windows environment variable, and dotenv will not override

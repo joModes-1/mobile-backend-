@@ -67,13 +67,6 @@ function generateOtp(): string {
   return code;
 }
 
-function generateMemberCode(): string {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let code = 'MC-';
-  for (let i = 0; i < 8; i++) code += chars[Math.floor(Math.random() * chars.length)];
-  return code;
-}
-
 const startSchema = z.object({ phone: z.string().min(9).max(20) });
 
 /**
@@ -287,7 +280,7 @@ router.post('/verify', async (req: Request, res: Response, next: NextFunction) =
 
     // ── Otherwise, a client — existing or new ────────────────────────
     let row = (await conn.query(
-      `SELECT id, org_id, full_name, member_code FROM clients WHERE phone = $1 LIMIT 1`,
+      `SELECT id, org_id, full_name FROM clients WHERE phone = $1 LIMIT 1`,
       [phone]
     )).rows[0];
 
@@ -325,12 +318,11 @@ router.post('/verify', async (req: Request, res: Response, next: NextFunction) =
 
       row = (await conn.query(
         `INSERT INTO clients
-           (org_id, full_name, phone, member_code, phone_verified,
+           (org_id, full_name, phone, phone_verified,
             username, email, email_verified, password_hash)
-         VALUES ($1, $2, $3, $4, true, $5, $6, false, NULL)
-         RETURNING id, org_id, full_name, member_code`,
-        [orgId, resolvedName || 'Customer', phone,
-         generateMemberCode(), `u${local}`, `${local}@phone.local`]
+         VALUES ($1, $2, $3, true, $4, $5, false, NULL)
+         RETURNING id, org_id, full_name`,
+        [orgId, resolvedName || 'Customer', phone, `u${local}`, `${local}@phone.local`]
       )).rows[0];
     } else {
       await conn.query(
@@ -356,7 +348,6 @@ router.post('/verify', async (req: Request, res: Response, next: NextFunction) =
         account_type: 'client',
         access_token: accessToken,
         refresh_token: refreshToken,
-        member_code: row.member_code,
         full_name: row.full_name,
         phone_display: displayUgPhone(phone),
       },

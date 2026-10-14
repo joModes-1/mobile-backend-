@@ -1,38 +1,12 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import argon2 from 'argon2';
 import { z } from 'zod';
 import { getPool } from '@/db';
 import { createAppError } from '@/middleware/errorHandler';
 import { authenticate } from '@/middleware/auth';
 import { requirePlatform } from '@/middleware/requirePlatform';
-import { generateTempPassword } from '@/utils/tempPassword';
-import { sendStaffTempPasswordEmail } from '@/utils/email';
+import { normalizeUgPhone, displayUgPhone } from '@/utils/sms';
 
 const router = Router();
-
-/**
- * Email a new admin their temporary password.
- *
- * Never throws: the account has already been created by the time this runs,
- * so a mail failure must not turn a successful creation into an error. The
- * caller reports whether it went out, and the password stays in the response
- * either way so the sysadmin can always fall back to reading it out.
- */
-async function tryEmailTempPassword(
-  email: string,
-  fullName: string,
-  username: string,
-  tempPassword: string,
-  reason: 'created' | 'reset'
-): Promise<boolean> {
-  try {
-    await sendStaffTempPasswordEmail(email, fullName, username, tempPassword, reason);
-    return true;
-  } catch (err) {
-    console.error(`[email] temp password to ${email} failed:`, err);
-    return false;
-  }
-}
 
 // All routes require platform auth
 router.use(authenticate, requirePlatform);
@@ -45,7 +19,9 @@ const createOrgSchema = z.object({
   contact_name: z.string().optional(),
   admin_name: z.string().min(1),
   admin_email: z.string().email(),
-  admin_phone: z.string().optional(),
+  // Required now: this is the new orgadmin's actual sign-in identity
+  // (phone + OTP), not just a contact detail.
+  admin_phone: z.string().min(9),
 });
 
 const updateOrgSchema = z.object({
@@ -101,7 +77,9 @@ const paymentSchema = z.object({
 const addAdminSchema = z.object({
   full_name: z.string().min(1),
   email: z.string().email(),
-  phone: z.string().optional(),
+  // Required now: this is how the account actually signs in (phone + OTP).
+  // email stays for contact/notification purposes only.
+  phone: z.string().min(9),
 });
 
 // Platform admins sign in with a username. It is optional on the wire: when
@@ -166,6 +144,18 @@ router.post('/orgs', async (req: Request, res: Response, next: NextFunction) => 
   try {
     const data = createOrgSchema.parse(req.body);
     const pool = getPool();
+
+    const adminPhone = normalizeUgPhone(data.admin_phone);
+    if (!adminPhone) {
+      next(createAppError(422, 'INVALID_PHONE', 'Enter a valid Ugandan mobile number for the admin'));
+      return;
+    }
+    const phoneTaken = await pool.query('SELECT id FROM staff_users WHERE phone = $1 LIMIT 1', [adminPhone]);
+    if (phoneTaken.rows.length > 0) {
+      next(createAppError(409, 'PHONE_TAKEN', 'Another staff member already uses this number'));
+      return;
+    }
+
     const client = await pool.connect();
 
     try {
@@ -179,18 +169,15 @@ router.post('/orgs', async (req: Request, res: Response, next: NextFunction) => 
       );
       const orgId = orgResult.rows[0].id;
 
-      // Generate temp password for orgadmin
-      const tempPassword = generateTempPassword();
-      const passwordHash = await argon2.hash(tempPassword);
-
-      // Create orgadmin (no branch_id, as per constraint).
-      // created_by is NULL: it references staff_users(id), and the creator here
-      // is a platform admin, which is a different table. The platform actor is
-      // recorded in the audit_logs row below instead.
+      // Create orgadmin (no branch_id, as per constraint) — phone + OTP
+      // sign-in, same as every other staff account. created_by is NULL: it
+      // references staff_users(id), and the creator here is a platform
+      // admin, a different table — the platform actor is recorded in the
+      // audit_logs row below instead.
       const adminResult = await client.query(
-        `INSERT INTO staff_users (org_id, branch_id, role, full_name, username, email, password_hash, must_change_password, created_by)
-         VALUES ($1, NULL, 'orgadmin', $2, $3, $4, $5, true, NULL) RETURNING id`,
-        [orgId, data.admin_name, data.admin_email.split('@')[0], data.admin_email, passwordHash]
+        `INSERT INTO staff_users (org_id, branch_id, role, full_name, username, email, phone, password_hash, must_change_password, created_by)
+         VALUES ($1, NULL, 'orgadmin', $2, $3, $4, $5, NULL, false, NULL) RETURNING id`,
+        [orgId, data.admin_name, data.admin_email.split('@')[0], data.admin_email, adminPhone]
       );
 
       // Audit log
@@ -202,26 +189,14 @@ router.post('/orgs', async (req: Request, res: Response, next: NextFunction) => 
 
       await client.query('COMMIT');
 
-      // Email the credentials to the new admin. staffRoutes has always done
-      // this for staff it creates; the platform routes did not, so an org
-      // admin created here only ever learned their password if the sysadmin
-      // read it off the screen and passed it on by hand.
-      // After COMMIT, and non-fatal: the organisation exists either way, and
-      // the password is still returned below as the fallback.
-      const emailed = await tryEmailTempPassword(
-        data.admin_email, data.admin_name, data.admin_email.split('@')[0], tempPassword, 'created'
-      );
-
       res.status(201).json({
         ok: true,
         data: {
           org_id: orgId,
           admin_id: adminResult.rows[0].id,
-          temp_password: tempPassword,
-          emailed,
-          message: emailed
-            ? `Organization created. The temporary password was emailed to ${data.admin_email}.`
-            : 'Organization created. Share the temp password with the admin. It will not be shown again.',
+          admin_phone: adminPhone,
+          admin_phone_display: displayUgPhone(adminPhone),
+          message: `Organization created. The admin signs in with ${displayUgPhone(adminPhone)} and the code sent to that phone.`,
         },
       });
     } catch (err) {
@@ -465,15 +440,23 @@ router.post('/orgs/:id/admins', async (req: Request, res: Response, next: NextFu
       return;
     }
 
-    const tempPassword = generateTempPassword();
-    const passwordHash = await argon2.hash(tempPassword);
+    const phone = normalizeUgPhone(data.phone);
+    if (!phone) {
+      next(createAppError(422, 'INVALID_PHONE', 'Enter a valid Ugandan mobile number'));
+      return;
+    }
+    const phoneTaken = await pool.query('SELECT id FROM staff_users WHERE phone = $1 LIMIT 1', [phone]);
+    if (phoneTaken.rows.length > 0) {
+      next(createAppError(409, 'PHONE_TAKEN', 'Another staff member already uses this number'));
+      return;
+    }
 
     // created_by stays NULL — see the note in POST /orgs: the creating actor is
     // a platform admin, and that column references staff_users(id).
     const result = await pool.query(
-      `INSERT INTO staff_users (org_id, branch_id, role, full_name, username, email, password_hash, must_change_password, created_by)
-       VALUES ($1, NULL, 'orgadmin', $2, $3, $4, $5, true, NULL) RETURNING id`,
-      [id, data.full_name, data.email.split('@')[0], data.email, passwordHash]
+      `INSERT INTO staff_users (org_id, branch_id, role, full_name, username, email, phone, password_hash, must_change_password, created_by)
+       VALUES ($1, NULL, 'orgadmin', $2, $3, $4, $5, NULL, false, NULL) RETURNING id`,
+      [id, data.full_name, data.email.split('@')[0], data.email, phone]
     );
 
     // Audit
@@ -483,19 +466,13 @@ router.post('/orgs/:id/admins', async (req: Request, res: Response, next: NextFu
       [id, req.actor!.sub, result.rows[0].id, JSON.stringify({ email: data.email, role: 'orgadmin' })]
     );
 
-    const emailed = await tryEmailTempPassword(
-      data.email, data.full_name, data.email.split('@')[0], tempPassword, 'created'
-    );
-
     res.status(201).json({
       ok: true,
       data: {
         admin_id: result.rows[0].id,
-        temp_password: tempPassword,
-        emailed,
-        message: emailed
-          ? `Orgadmin created. The temporary password was emailed to ${data.email}.`
-          : 'Orgadmin created. Share the temp password. It will not be shown again.',
+        phone,
+        phone_display: displayUgPhone(phone),
+        message: `Orgadmin created. They sign in with ${displayUgPhone(phone)} and the code sent to that phone.`,
       },
     });
   } catch (err) {
@@ -521,13 +498,21 @@ router.get('/admins', async (_req: Request, res: Response, next: NextFunction) =
 
 /**
  * POST /platform/admins
- * Add a new platform admin
+ * Add a new platform admin — phone + OTP sign-in, same as staff. No
+ * password is generated or emailed; the account signs in the moment
+ * someone verifies a code sent to `phone`.
  */
 router.post('/admins', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const data = addPlatformAdminSchema.parse(req.body);
     const pool = getPool();
     const username = (data.username || data.email.split('@')[0]).trim();
+
+    const phone = normalizeUgPhone(data.phone);
+    if (!phone) {
+      next(createAppError(422, 'INVALID_PHONE', 'Enter a valid Ugandan mobile number'));
+      return;
+    }
 
     // Fail with a clear message rather than a raw unique-violation.
     const clash = await pool.query(
@@ -539,17 +524,16 @@ router.post('/admins', async (req: Request, res: Response, next: NextFunction) =
       return;
     }
 
-    const tempPassword = generateTempPassword();
-    const passwordHash = await argon2.hash(tempPassword);
+    const phoneTaken = await pool.query('SELECT id FROM platform_admins WHERE phone = $1 LIMIT 1', [phone]);
+    if (phoneTaken.rows.length > 0) {
+      next(createAppError(409, 'PHONE_TAKEN', 'Another platform admin already uses this number'));
+      return;
+    }
 
     const result = await pool.query(
       `INSERT INTO platform_admins (full_name, username, email, phone, password_hash, must_change_password)
-       VALUES ($1, $2, $3, $4, $5, true) RETURNING id`,
-      [data.full_name, username, data.email, data.phone || null, passwordHash]
-    );
-
-    const emailed = await tryEmailTempPassword(
-      data.email, data.full_name, username, tempPassword, 'created'
+       VALUES ($1, $2, $3, $4, NULL, false) RETURNING id`,
+      [data.full_name, username, data.email, phone]
     );
 
     res.status(201).json({
@@ -557,71 +541,9 @@ router.post('/admins', async (req: Request, res: Response, next: NextFunction) =
       data: {
         admin_id: result.rows[0].id,
         username,
-        temp_password: tempPassword,
-        emailed,
-        message: emailed
-          ? `Admin created. The temporary password was emailed to ${data.email}.`
-          : 'Admin created. Share the temp password. It will not be shown again.',
-      },
-    });
-  } catch (err) {
-    next(err);
-  }
-});
-
-/**
- * POST /platform/admins/:id/reset-password
- * Reset another sysadmin's password (cannot target self)
- */
-router.post('/admins/:id/reset-password', async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const pool = getPool();
-    const { id } = req.params;
-
-    // Cannot reset self
-    if (id === req.actor!.sub) {
-      next(createAppError(403, 'CANNOT_RESET_SELF', 'Cannot reset your own password through this endpoint'));
-      return;
-    }
-
-    // Check target exists. Name/username/email come back too so the new
-    // password can be emailed rather than read off a screen.
-    const target = await pool.query(
-      'SELECT id, full_name, username, email FROM platform_admins WHERE id = $1',
-      [id]
-    );
-    if (target.rows.length === 0) {
-      next(createAppError(404, 'NOT_FOUND', 'Admin not found'));
-      return;
-    }
-    const targetAdmin = target.rows[0];
-
-    const tempPassword = generateTempPassword();
-    const passwordHash = await argon2.hash(tempPassword);
-
-    await pool.query(
-      'UPDATE platform_admins SET password_hash = $1, must_change_password = true, updated_at = now() WHERE id = $2',
-      [passwordHash, id]
-    );
-
-    // Revoke all refresh tokens
-    await pool.query(
-      'UPDATE refresh_tokens SET revoked_at = now() WHERE owner_type = $1 AND owner_id = $2 AND revoked_at IS NULL',
-      ['platform', id]
-    );
-
-    const emailed = await tryEmailTempPassword(
-      targetAdmin.email, targetAdmin.full_name, targetAdmin.username, tempPassword, 'reset'
-    );
-
-    res.json({
-      ok: true,
-      data: {
-        temp_password: tempPassword,
-        emailed,
-        message: emailed
-          ? `Password reset. The new temporary password was emailed to ${targetAdmin.email}.`
-          : 'Password reset. Share the temp password. It will not be shown again.',
+        phone,
+        phone_display: displayUgPhone(phone),
+        message: `Admin created. They sign in with ${displayUgPhone(phone)} and the code sent to that phone.`,
       },
     });
   } catch (err) {

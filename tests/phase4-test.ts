@@ -72,8 +72,8 @@ async function main() {
 
   r = await req('GET', '/api/v1/services', MG);
   const svcs = r.body.data;
-  const fullWashId = svcs.find((s: any) => s.name === 'Full wash').id;
-  const halfWashId = svcs.find((s: any) => s.name === 'Half wash').id;
+  const fullWashId = svcs.find((s: any) => s.name === 'Bikes').id;
+  const halfWashId = svcs.find((s: any) => s.name === 'Heavy vehicle').id;
 
   // ── Reset: clear washes and shifts left behind by a previous run ──
   // This suite ends with joseph holding an open shift and an in_progress
@@ -211,50 +211,26 @@ async function main() {
     assert(r.status === 409, `expected 409 got ${r.status}`);
   });
 
-  // ── Test: Receipt numbers sequential ──
-  await test('Receipt numbers sequential per branch per day', async () => {
-    assert(!!receiptNo.match(/^NTD-\d{8}-\d{4}$/), `receipt format: ${receiptNo}`);
+  // ── Test: Receipt number format ──
+  // 6 digits + 2 letters + 6 digits (e.g. 850779GE828923), random and
+  // unique — replaced the old guessable NTD-YYYYMMDD-#### counter.
+  await test('Receipt number is 6 digits + 2 letters + 6 digits', async () => {
+    assert(!!receiptNo.match(/^\d{6}[A-Z]{2}\d{6}$/), `receipt format: ${receiptNo}`);
   });
 
   // ── Test: Client flow with loyalty ──
-  // First, login as client and generate start token
-  let clientToken: string;
-  let clientAccessToken: string;
-  let clientWashId: string;
+  // The client register / request-otp calls that used to sit here are gone
+  // with those routes: clients sign in with phone + OTP via `/auth/phone/*`
+  // (see tests/helpers/auth.ts). None of them carried an assertion — the
+  // value in this file is the wash lifecycle below, not the auth flow.
 
-  // Register the client via OTP flow (or use existing seeded client)
-  r = await req('POST', '/api/v1/auth/client/register', undefined, {
-    phone: '+256700999999',
-    name: 'Test Client',
-  });
-  // Client may need OTP, let's use the manual register endpoint instead
+  // Walk-in registration at the bay still exists; harmless if it duplicates.
   r = await req('POST', '/api/v1/clients', W1, {
     phone: '+256700999999',
     name: 'Test Client',
   });
-  // May be duplicate, that's ok
 
-  // Login as existing seeded client
-  r = await req('POST', '/api/v1/auth/client/register', undefined, {
-    phone: '+256700123456',
-    name: 'Peter O.',
-  });
-
-  // Use the seeded client's phone to login
-  r = await req('POST', '/api/v1/auth/client/request-otp', undefined, {
-    phone: '+256700123456',
-  });
-
-  // We need to get the OTP code from DB to verify. Use a helper.
-  // For testing, let's use the internal endpoint approach.
-  // Actually, we can verify with any 6-digit code since the test DB has them.
-  // Let's just read it from the DB directly via a helper.
-  // Alternative: use the client token approach.
-
-  // Skip the complex client OTP flow and test with direct login
-  // The key test is the wash lifecycle, not the auth flow
-
-  // Let me test settlement with a pay token
+  // Test settlement with a pay token
   await test('Settlement with pay token', async () => {
     // Start a new wash
     r = await req('POST', '/api/v1/washes', W1, {

@@ -1,10 +1,8 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import { getPool } from '@/db';
-import { getEnv } from '@/config';
 import { createAppError } from '@/middleware/errorHandler';
 import { authenticate } from '@/middleware/auth';
-import { sendIssueReportEmail, sendIssueResolvedEmail } from '@/utils/email';
 
 const router = Router();
 
@@ -120,33 +118,9 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
     );
     const saved = inserted.rows[0];
 
-    // The report is already stored. Emailing is best-effort on top of that:
-    // a failure is recorded on the row rather than thrown, so a broken mail
-    // server never costs the user their report or shows them an error for
-    // something that did in fact save.
-    const supportTo = getEnv().SUPPORT_EMAIL;
-    if (supportTo) {
-      try {
-        await sendIssueReportEmail(supportTo, {
-          reference,
-          subject: data.subject,
-          body: data.body,
-          category: data.category,
-          severity: data.severity,
-          reporter_name: who.name,
-          reporter_role: who.role,
-          org_name: who.orgName,
-          branch_name: who.branchName,
-          context: data.context || null,
-        });
-        await pool.query('UPDATE issue_reports SET emailed_at = now() WHERE id = $1', [saved.id]);
-      } catch (mailErr: any) {
-        await pool.query(
-          'UPDATE issue_reports SET email_error = $1 WHERE id = $2',
-          [String(mailErr?.message || mailErr).slice(0, 500), saved.id]
-        );
-      }
-    }
+    // Email notification was removed from the platform entirely (along with
+    // the rest of the SMTP surface). The report is stored and visible on the
+    // in-app Reports screen; nothing is emailed to anyone any more.
 
     res.status(201).json({
       ok: true,
@@ -154,7 +128,7 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
         id: saved.id,
         reference: saved.reference,
         created_at: saved.created_at,
-        message: 'Thanks — your report has been sent.',
+        message: 'Thanks — your report has been saved.',
       },
     });
   } catch (err) {
@@ -249,7 +223,7 @@ router.patch('/:id', async (req: Request, res: Response, next: NextFunction) => 
     // Load first: an org admin may only touch their own organisation's
     // reports, and the reporter's address is needed to notify them.
     const existing = await pool.query(
-      `SELECT id, reference, subject, org_id, status, reporter_email, escalated_at
+      `SELECT id, reference, subject, org_id, status, escalated_at
        FROM issue_reports WHERE id = $1`,
       [id]
     );
@@ -302,34 +276,9 @@ router.patch('/:id', async (req: Request, res: Response, next: NextFunction) => 
 
     const updated = result.rows[0];
 
-    // Tell the reporter their problem was dealt with. Best-effort and after
-    // the update: the status change is already committed, so a mail failure
-    // is recorded on the row rather than failing the request.
-    let notified = false;
-    const justResolved = done && report.status !== data.status;
-    if (justResolved && updated.reporter_email) {
-      try {
-        const nameRow = isPlatform
-          ? await pool.query('SELECT full_name FROM platform_admins WHERE id = $1', [actor.sub])
-          : await pool.query('SELECT full_name FROM staff_users WHERE id = $1', [actor.sub]);
-        await sendIssueResolvedEmail(updated.reporter_email, {
-          reference: updated.reference,
-          subject: updated.subject,
-          status: updated.status,
-          resolution: updated.resolution,
-          resolved_by_name: nameRow.rows[0]?.full_name || null,
-        });
-        await pool.query('UPDATE issue_reports SET resolved_notified_at = now() WHERE id = $1', [id]);
-        notified = true;
-      } catch (mailErr: any) {
-        await pool.query(
-          'UPDATE issue_reports SET resolved_notify_error = $1 WHERE id = $2',
-          [String(mailErr?.message || mailErr).slice(0, 500), id]
-        );
-      }
-    }
-
-    res.json({ ok: true, data: { ...updated, reporter_notified: notified } });
+    // The reporter is no longer emailed the outcome — email was removed from
+    // the platform. They see the resolution on the in-app Reports screen.
+    res.json({ ok: true, data: { ...updated, reporter_notified: false } });
   } catch (err) {
     next(err);
   }

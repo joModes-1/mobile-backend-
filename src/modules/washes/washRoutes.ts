@@ -4,9 +4,10 @@ import { getPool } from '@/db';
 import { createAppError } from '@/middleware/errorHandler';
 import { requireRole, getOrgId } from '@/middleware/requireRole';
 import { consumeToken, hashToken } from '@/modules/tokens/tokenRoutes';
-import { processSettlement, ensureAccount } from '@/modules/loyalty';
+import { processSettlement, ensureAccount, hasArmedPromo, redeemPromo } from '@/modules/loyalty';
 import { awardForSettlement as awardWorkerPoints } from '@/modules/workerPoints';
 import { notify } from '@/modules/notify';
+import { generateReceiptNo } from '@/utils/receiptNo';
 
 const router = Router();
 
@@ -26,6 +27,62 @@ async function getOpenShift(pool: any, workerId: string, branchId: string): Prom
   return r.rows.length > 0 ? r.rows[0] : null;
 }
 
+/**
+ * Auto-assigns a client's freshly booked wash to the first free worker at
+ * that branch — "free" meaning an open shift and zero washes already
+ * in_progress. Called right after a client's booking commits, so a wash
+ * moves straight from 'requested' to 'in_progress' with no worker having
+ * to tap anything, matching the wall-mounted-QR self-service model: a
+ * worker is simply picked the moment a client scans in, if one is free.
+ *
+ * If nobody is free, the wash stays 'requested' and falls back to the
+ * existing manual POST /:id/accept path — a worker finishing their current
+ * car can still pick it up from the request list once they are free.
+ *
+ * Race-safe the same way /accept already is: the actual claim is one
+ * conditional UPDATE, so two calls racing (this auto-assign and a manual
+ * accept, or two auto-assigns from a burst of simultaneous bookings)
+ * cannot both win.
+ */
+export async function tryAutoAssign(pool: any, washId: string, branchId: string): Promise<{ workerId: string; jobNo: string } | null> {
+  // Oldest-shift-first is an arbitrary but stable tie-break — any free
+  // worker is equally correct, this just keeps the pick deterministic
+  // rather than whatever order Postgres happens to return.
+  const candidates = await pool.query(
+    `SELECT s.worker_id, s.id AS shift_id
+       FROM shifts s
+      WHERE s.branch_id = $1 AND s.status = 'open'
+        AND NOT EXISTS (
+          SELECT 1 FROM washes w
+           WHERE w.started_by_worker_id = s.worker_id AND w.status = 'in_progress'
+        )
+      ORDER BY s.opened_at ASC`,
+    [branchId]
+  );
+
+  for (const candidate of candidates.rows) {
+    const claimed = await pool.query(
+      `UPDATE washes
+          SET status = 'in_progress', started_by_worker_id = $1, started_shift_id = $2,
+              started_at = now(), updated_at = now()
+        WHERE id = $3 AND branch_id = $4
+          AND status = 'requested' AND started_by_worker_id IS NULL
+        RETURNING job_no`,
+      [candidate.worker_id, candidate.shift_id, washId, branchId]
+    );
+    if (claimed.rows.length > 0) {
+      return { workerId: candidate.worker_id, jobNo: claimed.rows[0].job_no };
+    }
+    // Someone else claimed it between the SELECT and this UPDATE (another
+    // auto-assign, or a manual accept) — the wash is no longer 'requested',
+    // so every subsequent candidate's UPDATE will also match zero rows.
+    // Stop rather than looping through the rest pointlessly.
+    return null;
+  }
+
+  return null;
+}
+
 export async function bumpJobNo(pool: any, branchId: string, branchCode: string): Promise<string> {
   const r = await pool.query(
     `INSERT INTO branch_counters (branch_id, day, last_job_seq)
@@ -36,24 +93,6 @@ export async function bumpJobNo(pool: any, branchId: string, branchCode: string)
   );
   const seq = r.rows[0].last_job_seq;
   return `${branchCode}-${seq}`;
-}
-
-async function bumpReceiptNo(pool: any, branchId: string, branchCode: string): Promise<string> {
-  // Use Postgres's CURRENT_DATE for both the counter key and the printed date
-  // so they can never disagree near a timezone day-boundary. The date is
-  // formatted in SQL (to_char) rather than round-tripped through a JS Date,
-  // since converting a DATE to a JS Date and back to a string can shift the
-  // day depending on the Node process's local timezone.
-  const r = await pool.query(
-    `INSERT INTO branch_counters (branch_id, day, last_receipt_seq)
-     VALUES ($1, CURRENT_DATE, 1)
-     ON CONFLICT (branch_id, day) DO UPDATE SET last_receipt_seq = branch_counters.last_receipt_seq + 1
-     RETURNING last_receipt_seq, to_char(day, 'YYYYMMDD') as day_str`,
-    [branchId]
-  );
-  const seq = String(r.rows[0].last_receipt_seq).padStart(4, '0');
-  const dateStr = r.rows[0].day_str;
-  return `${branchCode}-${dateStr}-${seq}`;
 }
 
 // ─── POST /washes — Start a wash ─────────────────────────────
@@ -840,27 +879,43 @@ async function settleWash(
       ]
     );
 
-    // 7. Receipt number
-    const receiptNo = await bumpReceiptNo(client, wash.branch_id, wash.branch_code);
-    await client.query(
-      `UPDATE washes SET receipt_no = $1 WHERE id = $2`,
-      [receiptNo, washId]
+    // 7. Receipt number — keep the one the client already saw when they
+    // declared a payment method; only generate if there isn't one yet.
+    const receiptRes = await client.query(
+      `UPDATE washes SET receipt_no = COALESCE(receipt_no, $1) WHERE id = $2 RETURNING receipt_no`,
+      [generateReceiptNo(), washId]
     );
+    const receiptNo: string = receiptRes.rows[0].receipt_no;
 
     // 8. Loyalty
+    //
+    // The "wash 2 for the price of 1" promo is checked FIRST and inside
+    // this transaction: an is_redemption wash backed by an armed promo goes
+    // to redeemPromo() — which burns NO credit and stamps NO extra wash —
+    // instead of processSettlement's redemption branch, which would
+    // otherwise decrement a real free_wash_credit the client earned.
+    let promoRedeemed = false;
+    if (wash.client_id && wash.promo_key && wash.is_redemption) {
+      promoRedeemed = await hasArmedPromo(client, wash.client_id, wash.promo_key);
+    }
+
     let loyaltyResult: any = null;
     if (wash.client_id) {
       await ensureAccount(client, wash.client_id, opts.orgId);
-      loyaltyResult = await processSettlement(
-        client,
-        wash.client_id,
-        opts.orgId,
-        washId,
-        wash.is_redemption,
-        wash.earns_point,
-        amountUgx,
-        opts.workerId
-      );
+      if (promoRedeemed) {
+        loyaltyResult = await redeemPromo(client, wash.client_id, washId, opts.workerId);
+      } else {
+        loyaltyResult = await processSettlement(
+          client,
+          wash.client_id,
+          opts.orgId,
+          washId,
+          wash.is_redemption,
+          wash.earns_point,
+          amountUgx,
+          opts.workerId
+        );
+      }
     }
 
     // 8b. Worker points — the staff side of the same moment. Inside this
@@ -915,6 +970,24 @@ async function settleWash(
         wash_id: washId, collected_by_name: starterResult.rows[0]?.full_name || 'another worker',
         job_no: wash.job_no, amount_ugx: amountUgx,
       });
+    }
+    if (promoRedeemed) {
+      notify('client', wash.client_id, 'promo_used', { wash_id: washId, job_no: wash.job_no });
+    }
+    if (
+      !promoRedeemed &&
+      wash.client_id &&
+      wash.promo_key &&
+      wash.status === 'settled' &&
+      !wash.is_redemption
+    ) {
+      // The paid wash of a promo just settled — the reward is earned.
+      // Narrow on promo_key + not-redemption: a settled wash WITH the key
+      // that was NOT free is the paid one, by construction. Guarded by the
+      // same UPDATE predicate that flips the row, so re-settling (already
+      // impossible — status gate above) or a plain booking with a stray key
+      // cannot double-fire.
+      notify('client', wash.client_id, 'promo_earned', { wash_id: washId, job_no: wash.job_no });
     }
 
     res.json({
@@ -989,6 +1062,19 @@ router.post('/:id/cancel', requireRole('orgadmin', 'manager', 'worker'), async (
       return;
     }
 
+    // Promo unwinding: if a promo redemption still points its PAID wash at
+    // this cancelled wash and the reward was never spent, the offer never
+    // legitimately armed — the paid wash never settled — so the row goes
+    // away and the client can grab the offer again. (The client's own
+    // cancel-request route has the equivalent cleanup for not-yet-accepted
+    // bookings.) Once used, immutable: the reward was consumed by a settled
+    // wash, and no later cancellation rewrites history.
+    await pool.query(
+      `DELETE FROM promo_redemptions
+        WHERE started_wash_id = $1 AND status = 'armed' AND free_wash_id IS NULL`,
+      [id]
+    );
+
     res.json({ ok: true, data: result.rows[0] });
   } catch (err) {
     next(err);
@@ -997,9 +1083,11 @@ router.post('/:id/cancel', requireRole('orgadmin', 'manager', 'worker'), async (
 
 // ─── POST /washes/:id/attach-client ──────────────────────────
 
+// The member_code lookup was removed with the member code itself — it was
+// the old worker-typed-the-customer's-code path, replaced by self-service
+// booking. A start token is now the only way to attach a customer.
 const attachSchema = z.object({
-  start_token: z.string().optional(),
-  member_code: z.string().optional(),
+  start_token: z.string().min(1),
   // Attaching late should still allow spending a saved credit, otherwise the
   // only way to redeem is to cancel the car and start it again.
   use_free_wash: z.boolean().optional().default(false),
@@ -1009,7 +1097,6 @@ router.post('/:id/attach-client', requireRole('orgadmin', 'manager', 'worker'), 
   try {
     const pool = getPool();
     const { id } = req.params;
-    const orgId = getOrgId(req.actor!);
     const body = attachSchema.parse(req.body);
 
     // Wash must exist and be in_progress
@@ -1030,42 +1117,15 @@ router.post('/:id/attach-client', requireRole('orgadmin', 'manager', 'worker'), 
       return;
     }
 
-    let clientId: string | null = null;
-    let startVerified = false;
-    let attachMethod = 'manual_lookup';
-
-    if (body.start_token) {
-      const tokenHash = hashToken(body.start_token);
-      const consumed = await consumeToken(pool, tokenHash, 'start', req.actor!.sub);
-      if (!consumed) {
-        next(createAppError(409, 'BAD_TOKEN', 'Invalid or expired start token'));
-        return;
-      }
-      clientId = consumed.client_id;
-      startVerified = true;
-      attachMethod = 'start_token';
-    } else if (body.member_code) {
-      const clientResult = await pool.query(
-        // Typed by hand on a phone, so match forgivingly: ignore case, spaces
-        // and dashes. An exact match rejected "mc-e68umekx" and even a
-        // trailing space, which read to the worker as "client not found".
-        `SELECT id FROM clients
-         WHERE org_id = $2
-           AND upper(replace(replace(member_code, '-', ''), ' ', ''))
-             = upper(replace(replace($1, '-', ''), ' ', ''))`,
-        [body.member_code.trim(), orgId]
-      );
-      if (clientResult.rows.length === 0) {
-        next(createAppError(404, 'CLIENT_NOT_FOUND', 'Client not found with this member code'));
-        return;
-      }
-      clientId = clientResult.rows[0].id;
-      startVerified = false;
-      attachMethod = 'manual_lookup';
-    } else {
-      next(createAppError(422, 'TOKEN_OR_CODE_REQUIRED', 'Provide start_token or member_code'));
+    const tokenHash = hashToken(body.start_token);
+    const consumed = await consumeToken(pool, tokenHash, 'start', req.actor!.sub);
+    if (!consumed) {
+      next(createAppError(409, 'BAD_TOKEN', 'Invalid or expired start token'));
       return;
     }
+    const clientId: string | null = consumed.client_id;
+    const startVerified = true;
+    const attachMethod = 'start_token';
 
     // Optionally spend a saved credit now that we know who the customer is.
     // The credit itself is consumed at settlement, exactly as it is when a

@@ -58,7 +58,7 @@ async function main() {
   const suvId = r.body.data.find((v: any) => v.name === 'SUV').id;
 
   r = await req('GET', '/api/v1/services', MG);
-  const fullWashId = r.body.data.find((s: any) => s.name === 'Full wash').id;
+  const fullWashId = r.body.data.find((s: any) => s.name === 'Bikes').id;
 
   // Get a client to run the loyalty tests against.
   // This used to hardcode Peter O.'s phone, but the seed has since moved it,
@@ -71,7 +71,6 @@ async function main() {
     client = r.body?.data?.clients?.[0];
   }
   const clientId: string | undefined = client?.id;
-  const clientMemberCode: string | undefined = client?.member_code;
   if (!clientId) console.log('WARNING: no client found — loyalty tests will skip');
 
   // Open shift for worker1.
@@ -124,11 +123,10 @@ async function main() {
     }, { 'Idempotency-Key': key });
     const washId = r.body.data.wash_id;
 
-    // Attach client manually
-    if (clientId) {
-      await req('POST', `/api/v1/washes/${washId}/attach-client`, W1, { member_code: 'MC-FAKE' });
-      // Actually let's just use the settle path which sets client_id if we had a token
-    }
+    // Attaching a customer used to be possible by member code; that lookup
+    // was removed with the member code itself, and a start token is now the
+    // only way in. This settle path leaves the wash unattached, exactly as it
+    // did before (the member-code call here never matched anything).
 
     r = await req('POST', `/api/v1/washes/${washId}/wash-done`, W1);
     r = await req('POST', `/api/v1/washes/${washId}/settle`, W1, { unverified_reason: 'no_app' });
@@ -267,18 +265,10 @@ async function main() {
   await test('Client disputes within 24h → 200, status disputed', async () => {
     const washId = await createSettledWash();
 
-    // Need to attach a client first. Use member_code lookup.
-    // Actually the seeded client is not attached. Let's create a wash with client via token flow.
-    // Simpler: just dispute the walk-in (won't have client). Let me create one with client attached.
     r = await req('POST', '/api/v1/washes', W1, {
       vehicle_class_id: suvId,
     }, { 'Idempotency-Key': 'p5-disc-' + Date.now() });
     const wId = r.body.data.wash_id;
-
-    // Attach client (member code resolved during setup)
-    if (clientMemberCode) {
-      r = await req('POST', `/api/v1/washes/${wId}/attach-client`, W1, { member_code: clientMemberCode });
-    }
 
     r = await req('POST', `/api/v1/washes/${wId}/wash-done`, W1);
     assert(r.status === 200, 'wash done');

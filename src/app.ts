@@ -141,35 +141,30 @@ app.use('/api/v1/reports', authenticate, requirePasswordChanged, reportRouter);
 // it, and gating support on completing that flow would trap them.
 app.use('/api/v1/issues', issueRouter);
 
-// Client lookup (worker use) — must be after auth middleware
+// Client lookup by phone — must be after auth middleware.
+// The member_code lookup that used to live here is gone: the code was part
+// of the old worker-scans-the-customer flow, which self-service booking
+// replaced. Phone is the one identifier a client still has.
 app.get('/api/v1/clients/lookup', authenticate, requirePasswordChanged, requireRole('orgadmin', 'manager', 'worker'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const pool = getPool();
     const orgId = getOrgId(req.actor!);
-    const { member_code, phone } = req.query;
+    const { phone } = req.query;
 
-    if (!member_code && !phone) {
-      next(createAppError(400, 'QUERY_REQUIRED', 'Provide member_code or phone'));
+    if (!phone) {
+      next(createAppError(400, 'QUERY_REQUIRED', 'Provide phone'));
       return;
     }
 
-    let query = `SELECT c.id, c.full_name, c.member_code,
-                    COALESCE(la.wash_count, 0) as wash_count,
-                    COALESCE(la.free_wash_credits, 0) as free_wash_credits
-                 FROM clients c
-                 LEFT JOIN loyalty_accounts la ON c.id = la.client_id
-                 WHERE c.org_id = $1`;
-    const params: any[] = [orgId];
-
-    if (member_code) {
-      query += ` AND c.member_code = $2`;
-      params.push(member_code as string);
-    } else {
-      query += ` AND c.phone = $2`;
-      params.push(phone as string);
-    }
-
-    const result = await pool.query(query, params);
+    const result = await pool.query(
+      `SELECT c.id, c.full_name, c.phone,
+              COALESCE(la.wash_count, 0) as wash_count,
+              COALESCE(la.free_wash_credits, 0) as free_wash_credits
+         FROM clients c
+         LEFT JOIN loyalty_accounts la ON c.id = la.client_id
+        WHERE c.org_id = $1 AND c.phone = $2`,
+      [orgId, phone as string]
+    );
     if (result.rows.length === 0) {
       next(createAppError(404, 'CLIENT_NOT_FOUND', 'Client not found'));
       return;
@@ -191,7 +186,7 @@ app.get('/api/v1/clients', authenticate, requirePasswordChanged, requireRole('or
     const offset = Math.max(parseInt(req.query.offset as string) || 0, 0);
 
     let query = `
-      SELECT c.id, c.full_name, c.phone, c.member_code, c.status, c.created_at,
+      SELECT c.id, c.full_name, c.phone, c.status, c.created_at,
              COALESCE(la.wash_count, 0) as wash_count,
              COALESCE(la.free_wash_credits, 0) as free_wash_credits,
              COALESCE(la.lifetime_washes, 0) as lifetime_washes
@@ -202,7 +197,7 @@ app.get('/api/v1/clients', authenticate, requirePasswordChanged, requireRole('or
     const params: any[] = [orgId];
 
     if (q) {
-      query += ` AND (c.full_name ILIKE $2 OR c.phone ILIKE $2 OR c.member_code ILIKE $2)`;
+      query += ` AND (c.full_name ILIKE $2 OR c.phone ILIKE $2)`;
       params.push(`%${q}%`);
     }
 
@@ -243,13 +238,12 @@ app.post('/api/v1/clients', authenticate, requirePasswordChanged, requireRole('o
       return;
     }
 
-    const memberCode = 'MC-' + Math.random().toString(36).substring(2, 8).toUpperCase();
     const walkInUsername = 'walkin_' + Math.random().toString(36).substring(2, 10);
     const walkInEmail = `${walkInUsername}@walkin.local`;
     const result = await pool.query(
-      `INSERT INTO clients (org_id, full_name, phone, member_code, phone_verified, username, email)
-       VALUES ($1, $2, $3, $4, false, $5, $6) RETURNING id, full_name, phone, member_code`,
-      [orgId, name, phone, memberCode, walkInUsername, walkInEmail]
+      `INSERT INTO clients (org_id, full_name, phone, phone_verified, username, email)
+       VALUES ($1, $2, $3, false, $4, $5) RETURNING id, full_name, phone`,
+      [orgId, name, phone, walkInUsername, walkInEmail]
     );
 
     res.status(201).json({ ok: true, data: result.rows[0] });

@@ -351,17 +351,14 @@ async function main() {
       `${down.body?.data?.wash_count} vs ${up.body?.data?.wash_count}`);
   });
 
-  // ── Act 9: passwordless accounts do not 500 the old login ──
-  await act('Act 9 — orphaned password routes fail cleanly', async () => {
+  // ── Act 9: the removed password routes fail closed, not 500 ──
+  // `/auth/staff/login` no longer exists on the platform at all. An
+  // unauthenticated call to a path under /api/v1 that nothing claims falls
+  // through to the auth-guarded catch-all, so it answers 401 — never 500.
+  await act('Act 9 — removed password routes fail closed', async () => {
     const r = await call('POST', '/auth/staff/login', { username: 'p11_nonexistent', password: 'Whatever123!' });
-    check('unknown user gets 401, not 500', r.status === 401, 'status ' + r.status);
-
-    // A staff row created this run has no password at all.
-    if (createdStaffIds.length > 0) {
-      const uniqUser = 'p11_' + String(Date.now()).slice(-6);
-      const attempt = await call('POST', '/auth/staff/login', { username: uniqUser, password: 'Whatever123!' });
-      check('passwordless account does not 500', attempt.status !== 500, 'status ' + attempt.status);
-    }
+    check('removed login route is not a crash', r.status !== 500, 'status ' + r.status);
+    check('removed login route is unauthenticated', r.status === 401, 'status ' + r.status);
   });
 
   // ── Act 10: tenant isolation still holds ──

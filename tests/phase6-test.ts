@@ -182,9 +182,9 @@ async function main() {
   });
 
   await test('GET /reports/platform/stats → sysadmin', async () => {
-    r = await req('POST', '/api/v1/auth/platform/login', undefined, { email: 'admin@carwash.com', password: 'admin123' });
-    assert(r.status === 200, 'platform login');
-    const PToken = r.body.data.access_token;
+    // Platform-admin password login was removed — the sysadmin signs in with
+    // phone + OTP like every other actor now.
+    const PToken = await signInAs('sysadmin');
     r = await req('GET', '/api/v1/reports/platform/stats', PToken);
     assert(r.status === 200, `status ${r.status}`);
     assert(typeof r.body.data.total_orgs !== 'undefined', 'has total_orgs');

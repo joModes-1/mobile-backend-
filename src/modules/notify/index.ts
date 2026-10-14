@@ -112,6 +112,29 @@ export async function notify(
       })));
       break;
 
+    case 'promo_earned':
+      // "Wash 2 cars for the price of 1": the paid wash settled, so the
+      // client's next wash is free. Distinct from reward_earned, which is
+      // the loyalty-credit punch card.
+      messages.push(...tokens.map((to) => ({
+        to,
+        title: '🎉 Promo reward unlocked!',
+        body: "Wash 2 for the price of 1 — your next wash is FREE. Book it whenever you're ready.",
+        data: { event, wash_id: payload.wash_id },
+        sound: 'default',
+      })));
+      break;
+
+    case 'promo_used':
+      messages.push(...tokens.map((to) => ({
+        to,
+        title: 'Promo complete',
+        body: 'Your free promo wash is done. Thanks for washing with us!',
+        data: { event, wash_id: payload.wash_id, job_no: payload.job_no },
+        sound: 'default',
+      })));
+      break;
+
     case 'job_collected_by':
       messages.push(...tokens.map((to) => ({
         to,
