@@ -1,5 +1,6 @@
 import { Pool, types } from 'pg';
 import { getEnv } from '@/config';
+import { dbConnection } from '@/db/connection';
 
 // A DATE column is a calendar day, not an instant. node-postgres parses it
 // into a JS Date at *local* midnight, which then serialises to JSON as the
@@ -16,18 +17,24 @@ let pool: Pool | null = null;
 export function getPool(): Pool {
   if (!pool) {
     pool = new Pool({
-      connectionString: getEnv().DATABASE_URL,
-      // Render's managed Postgres requires SSL and presents a certificate
-      // that isn't in Node's trust chain, so a bare `ssl: true` gets rejected
-      // with SELF_SIGNED_CERT_IN_CHAIN. `rejectUnauthorized: false` still
-      // encrypts the connection — it just doesn't verify the CA — which
-      // matches how Render's own docs and most hosts on it connect. Local
-      // Postgres (DATABASE_URL without sslmode=require) is untouched: it
-      // never speaks TLS in dev, so forcing ssl there would break `npm run
-      // dev` instead of fixing anything.
-      ssl: /sslmode=require|render\.com/.test(getEnv().DATABASE_URL)
-        ? { rejectUnauthorized: false }
-        : undefined,
+      ...dbConnection(getEnv().DATABASE_URL),
+      max: 10,
+      // Hosted poolers (Supabase's Supavisor, PgBouncer) close connections
+      // that sit idle. Retire ours first so we don't hand out a dead one,
+      // and keep live ones from being dropped as "silent" by a firewall.
+      idleTimeoutMillis: 30_000,
+      keepAlive: true,
+      // Fail a request that can't get a connection instead of hanging it.
+      connectionTimeoutMillis: 10_000,
+    });
+
+    // A pooled connection can still be killed from the other end (provider
+    // restart, network blip). pg reports that as an 'error' event on the
+    // pool, and an unhandled 'error' event on an EventEmitter crashes the
+    // whole process. Log it and carry on: the pool discards the dead
+    // connection and opens a fresh one for the next query.
+    pool.on('error', (err) => {
+      console.error('[db] idle connection error (pool will reconnect):', err.message);
     });
   }
   return pool;
