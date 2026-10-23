@@ -5,6 +5,35 @@ import { createAppError } from '@/middleware/errorHandler';
 import { requireRole, getOrgId } from '@/middleware/requireRole';
 import { processSettlement, lockAccount, ensureAccount, getConfig, writeLedgerEntry } from '@/modules/loyalty';
 import { reverseForWash as reverseWorkerPoints } from '@/modules/workerPoints';
+import { reverseForWash as reverseClientPoints } from '@/modules/clientPoints';
+import { commissionFor, correctForWash, reverseForWash as reverseWallet } from '@/modules/wallet';
+
+/**
+ * Re-applies a settled wash's frozen commission rate to its corrected price
+ * and moves the wallets by the difference: the washer's commission, and —
+ * for a cash wash — what the settler owes. Returns the new commission.
+ *
+ * Only for washes the wallet already knows about. A wash settled before the
+ * wallet existed has no ledger rows to correct, and posting a bare
+ * difference for it would leave a balance nobody could explain.
+ */
+async function correctWallet(
+  client: any, wash: any, newPriceUgx: number, newAmountUgx: number, managerId: string, reason: string
+): Promise<{ commissionUgx: number }> {
+  const known = await client.query(`SELECT 1 FROM wallet_ledger WHERE wash_id = $1 LIMIT 1`, [wash.id]);
+  const oldCommission = Number(wash.worker_commission_ugx || 0);
+  if (known.rows.length === 0 || wash.worker_commission_bp == null) return { commissionUgx: oldCommission };
+
+  const newCommission = commissionFor(newPriceUgx, Number(wash.worker_commission_bp));
+  const cashDelta = wash.payment_method === 'cash' ? newAmountUgx - Number(wash.amount_ugx) : 0;
+  await correctForWash(client, {
+    washId: wash.id, orgId: wash.org_id,
+    starterId: wash.started_by_worker_id, settlerId: wash.settled_by_worker_id,
+    commissionDelta: newCommission - oldCommission, cashDelta, reason, createdBy: managerId,
+  });
+  await client.query(`UPDATE washes SET worker_commission_ugx = $1 WHERE id = $2`, [newCommission, wash.id]);
+  return { commissionUgx: newCommission };
+}
 import { resolvePrice } from '@/modules/pricing/resolvePrice';
 import { notify } from '@/modules/notify';
 
@@ -95,7 +124,10 @@ router.post('/:id/correct', requireRole('orgadmin', 'manager'), async (req: Requ
     }
 
     // Compute new amount (loyalty untouched — just update the financials)
-    const newAmount = wash.is_redemption ? 0 : Number(priceResult.price_ugx);
+    // Points the client spent at booking still count against the corrected
+    // price — the correction changes what the wash costs, not what they paid.
+    const newAmount = wash.is_redemption ? 0
+      : Math.max(0, Number(priceResult.price_ugx) - Number(wash.points_value_ugx || 0));
 
     // Snapshot before
     const before = {
@@ -121,11 +153,14 @@ router.post('/:id/correct', requireRole('orgadmin', 'manager'), async (req: Requ
       ]
     );
 
+    const walletCorrection = await correctWallet(client, wash, Number(priceResult.price_ugx), newAmount, managerId, 'Wash corrected');
+
     const after = {
       amount_ugx: newAmount,
       vehicle_class_id: body.vehicle_class_id,
       service_id: serviceId,
       price_id: priceResult.price_id,
+      worker_commission_ugx: walletCorrection.commissionUgx,
     };
 
     // Audit log
@@ -170,7 +205,14 @@ router.post('/:id/reverse', requireRole('orgadmin', 'manager'), async (req: Requ
   const orgId = getOrgId(req.actor!);
   const managerId = req.actor!.sub;
   const id = String(req.params.id);
-  const body = reverseSchema.parse(req.body);
+  // Validated before the transaction, and safely: a bad body must be a 400,
+  // not an exception thrown outside any try (which used to crash the server).
+  const parsed = reverseSchema.safeParse(req.body);
+  if (!parsed.success) {
+    next(parsed.error);
+    return;
+  }
+  const body = parsed.data;
 
   const client = await pool.connect();
   try {
@@ -223,6 +265,15 @@ router.post('/:id/reverse', requireRole('orgadmin', 'manager'), async (req: Requ
       washId: id,
       reversedBy: managerId,
     });
+
+    // Client points: refund what the wash spent, take back what it earned.
+    const clientPoints = await reverseClientPoints(client, {
+      washId: String(id), reason: body.reason, createdBy: managerId,
+    });
+
+    // Wallet: the wash didn't happen, so its commission is taken back and
+    // the settler no longer owes its cash.
+    const wallet = await reverseWallet(client, { washId: String(id), reason: body.reason, createdBy: managerId });
 
     // Loyalty reversal (if client attached)
     let loyaltyResult: any = null;
@@ -295,7 +346,7 @@ router.post('/:id/reverse', requireRole('orgadmin', 'manager'), async (req: Requ
     }
 
     // Audit log
-    const after = { status: 'reversed', loyalty: loyaltyResult };
+    const after = { status: 'reversed', loyalty: loyaltyResult, client_points: clientPoints, wallet };
     await auditLog(client, {
       orgId,
       actorType: 'staff',
@@ -317,6 +368,8 @@ router.post('/:id/reverse', requireRole('orgadmin', 'manager'), async (req: Requ
         wash_id: id,
         status: 'reversed',
         loyalty: loyaltyResult,
+        client_points: clientPoints,
+        wallet,
       },
     });
   } catch (err) {
@@ -427,7 +480,14 @@ router.post('/:id/resolve-dispute', requireRole('orgadmin', 'manager'), async (r
   const orgId = getOrgId(req.actor!);
   const managerId = req.actor!.sub;
   const id = String(req.params.id);
-  const body = resolveSchema.parse(req.body);
+  // Validated before the transaction, and safely: a bad body must be a 400,
+  // not an exception thrown outside any try (which used to crash the server).
+  const parsed = resolveSchema.safeParse(req.body);
+  if (!parsed.success) {
+    next(parsed.error);
+    return;
+  }
+  const body = parsed.data;
 
   const client = await pool.connect();
   try {
@@ -475,7 +535,8 @@ router.post('/:id/resolve-dispute', requireRole('orgadmin', 'manager'), async (r
 
       const originalAmountUgx = wash.original_amount_ugx || wash.amount_ugx;
       const originalVcId = wash.original_vehicle_class_id || wash.vehicle_class_id;
-      const newAmount = wash.is_redemption ? 0 : Number(priceResult.price_ugx);
+      const newAmount = wash.is_redemption ? 0
+        : Math.max(0, Number(priceResult.price_ugx) - Number(wash.points_value_ugx || 0));
 
       await client.query(
         `UPDATE washes SET
@@ -486,6 +547,7 @@ router.post('/:id/resolve-dispute', requireRole('orgadmin', 'manager'), async (r
          WHERE id = $8`,
         [vcId, svcId, priceResult.price_id, newAmount, managerId, originalAmountUgx, originalVcId, id]
       );
+      await correctWallet(client, wash, Number(priceResult.price_ugx), newAmount, managerId, 'Dispute resolved with correction');
     } else if (body.resolution === 'reverse') {
       // Run reversal logic then set to reversed
       await client.query(
@@ -494,6 +556,17 @@ router.post('/:id/resolve-dispute', requireRole('orgadmin', 'manager'), async (r
          WHERE id = $3`,
         [managerId, body.note || 'Dispute resolved with reversal', id]
       );
+
+      // Same unwinding as a direct reversal. Worker points were previously
+      // left in place on this path — a wash reversed through a dispute paid
+      // its worker as if it had happened.
+      await reverseWorkerPoints(client, { orgId, washId: String(id), reversedBy: managerId });
+      await reverseClientPoints(client, {
+        washId: String(id), reason: body.note || 'Dispute resolved with reversal', createdBy: managerId,
+      });
+      await reverseWallet(client, {
+        washId: String(id), reason: body.note || 'Dispute resolved with reversal', createdBy: managerId,
+      });
 
       // Loyalty reversal
       if (wash.client_id) {

@@ -52,7 +52,7 @@ router.get('/', authenticate, async (req: Request, res: Response, next: NextFunc
       // call needs it (a QR encodes org_id + branch code together, since
       // code is only unique per org) and had nothing to read it from.
       const result = await pool.query(
-        `SELECT c.id, c.full_name, c.username, c.email, c.email_verified, c.status,
+        `SELECT c.id, c.full_name, c.username, c.email, c.email_verified, c.status, c.phone,
                 c.org_id, o.name as org_name
            FROM clients c
            JOIN organizations o ON c.org_id = o.id
@@ -85,7 +85,16 @@ router.patch('/', authenticate, async (req: Request, res: Response, next: NextFu
     let idx = 1;
     if (data.full_name !== undefined) { updates.push(`full_name = $${idx++}`); values.push(data.full_name); }
     if (data.email !== undefined) { updates.push(`email = $${idx++}`); values.push(data.email); }
-    if (data.phone !== undefined) { updates.push(`phone = $${idx++}`); values.push(data.phone); }
+    // The phone number is the sign-in identity. Changing it here, with no
+    // code sent to the new number, let anyone claim a number they don't own
+    // (or lock themselves out with a typo). Staff numbers are changed by
+    // their manager on the Staff screen; a client's is fixed to the number
+    // they verified.
+    if (data.phone !== undefined) {
+      next(createAppError(400, 'PHONE_CHANGE_NOT_ALLOWED',
+        'Your phone number is how you sign in, so it can\'t be changed here.'));
+      return;
+    }
 
     if (updates.length === 0) {
       next(createAppError(400, 'NO_CHANGES', 'No fields to update'));

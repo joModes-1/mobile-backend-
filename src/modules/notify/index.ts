@@ -96,7 +96,10 @@ export async function notify(
       messages.push(...tokens.map((to) => ({
         to,
         title: 'Payment Confirmed',
-        body: `UGX ${payload.amount_ugx || '...'} paid. Receipt: ${payload.receipt_no || 'N/A'}. Washes: ${payload.wash_count ?? '?'}/${payload.washes_required ?? 7}`,
+        // Points replaced the stamp card, so the receipt reports what this
+        // wash earned and the new balance instead of "Washes: n/7".
+        body: `UGX ${payload.amount_ugx ?? '...'} paid. Receipt: ${payload.receipt_no || 'N/A'}.` +
+          (payload.points_earned ? ` +${payload.points_earned} points (balance ${payload.points_balance}).` : ''),
         data: { event, wash_id: payload.wash_id, receipt_no: payload.receipt_no },
         sound: 'default',
       })));
@@ -153,6 +156,28 @@ export async function notify(
         to,
         title: 'New wash request',
         body: `${payload.vehicle_class_name || 'A car'} — ${payload.service_name || 'wash'} is waiting to be accepted.`,
+        data: { event, wash_id: payload.wash_id, job_no: payload.job_no },
+        sound: 'default',
+      })));
+      break;
+
+    case 'wash_assigned':
+      // The accept window ran out and the dispatcher gave this job to the
+      // worker — they did not tap anything, so tell them it is theirs.
+      messages.push(...tokens.map((to) => ({
+        to,
+        title: 'New car assigned to you',
+        body: `Job ${payload.job_no || ''}: ${payload.vehicle_class_name || 'a car'} — ${payload.service_name || 'wash'}.`,
+        data: { event, wash_id: payload.wash_id, job_no: payload.job_no },
+        sound: 'default',
+      })));
+      break;
+
+    case 'unassigned_wash':
+      messages.push(...tokens.map((to) => ({
+        to,
+        title: 'Client waiting, no worker',
+        body: `Job ${payload.job_no || ''} has waited ${payload.minutes || 0} minutes at ${payload.branch_name || 'the branch'} and nobody on site can take it.`,
         data: { event, wash_id: payload.wash_id, job_no: payload.job_no },
         sound: 'default',
       })));

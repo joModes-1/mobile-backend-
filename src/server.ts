@@ -29,6 +29,14 @@ const server = app.listen(env.PORT, host, () => {
   startJobs();
 });
 
+// Last resort. Route handlers are already covered (middleware/asyncErrors);
+// this catches a stray rejection anywhere else — a fire-and-forget push, a
+// background job — and logs it instead of letting Node kill the server
+// for every user over one failed side task.
+process.on('unhandledRejection', (reason: any) => {
+  logger.error({ err: reason }, 'Unhandled promise rejection (server kept running)');
+});
+
 // Graceful shutdown
 process.on('SIGTERM', () => {
   logger.info('SIGTERM received, shutting down...');

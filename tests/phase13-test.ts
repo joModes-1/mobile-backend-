@@ -128,15 +128,11 @@ async function main() {
     check('the grab booking pays full price (not a redemption)', book.body?.data?.is_redemption === false, JSON.stringify(book.body?.data));
     check('response marks the offer earned', book.body?.data?.promo_earned === true, JSON.stringify(book.body?.data));
 
-    // Auto-assign only picks FREE workers — musa was just freed, so this
-    // should always be in_progress; if seeding changed, requested is fine
-    // too as long as a worker picks it up below.
-    if (book.body?.data?.status === 'requested') {
-      const acc = await call('POST', `/washes/${washId}/accept`, undefined, musa);
-      check('manual accept worked (no free worker at book time)', acc.status === 200, JSON.stringify(acc.body).slice(0, 200));
-    } else {
-      check('auto-assigned', book.body?.data?.status === 'in_progress', JSON.stringify(book.body?.data));
-    }
+    // A booking waits for its accept window (modules/dispatch); a free
+    // worker taking it is the normal path.
+    check('booking waits for a worker', book.body?.data?.status === 'requested', JSON.stringify(book.body?.data));
+    const acc = await call('POST', `/washes/${washId}/accept`, undefined, musa);
+    check('a free worker accepts it', acc.status === 200, JSON.stringify(acc.body).slice(0, 200));
 
     const state = await call('GET', '/me/washes/promo', undefined, client);
     check('promo now armed with active wash',

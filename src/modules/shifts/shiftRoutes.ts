@@ -7,21 +7,34 @@ import { requireRole, getOrgId } from '@/middleware/requireRole';
 const router = Router();
 
 /**
- * What the worker should be holding, and therefore hand over.
+ * The cash a single settled wash leaves in the settling worker's hand for
+ * the business, as a SQL expression over a `washes` row aliased `w`.
  *
- * Net of their own commission: the worker keeps their cut out of the cash
- * they collected, so the till was never going to receive it. Counting the
- * gross here would make every single handover look short by exactly the
- * commission, and the variance report would flag honest workers as light.
+ *  - Only cash. Mobile money went straight to the business and points or a
+ *    free wash moved no money. (This used to sum every method, which was
+ *    hidden while only cash carried a commission.)
+ *  - Net of commission only when the settler also washed the car: they
+ *    keep their cut out of the notes. On a handover the commission belongs
+ *    to the washer's wallet, so the settler hands in the full amount.
  *
- * Only cash rows carry a commission (see settlement), so summing the
- * column unconditionally is safe — mobile-money and free washes contribute
- * 0 to it.
+ * Commission now applies to every method, but for a non-cash wash it is
+ * paid into the wallet (modules/wallet), never out of the till.
+ */
+export const CASH_TO_HAND_IN_SQL = `
+  CASE WHEN w.payment_method = 'cash'
+       THEN w.amount_ugx - CASE WHEN w.started_by_worker_id = w.settled_by_worker_id
+                                THEN w.worker_commission_ugx ELSE 0 END
+       ELSE 0 END`;
+
+/**
+ * What the worker should be holding from this shift, and therefore hand
+ * over. Counting the gross would make every honest handover look short by
+ * exactly the commission.
  */
 async function computeExpectedCash(pool: any, shiftId: string): Promise<number> {
   const r = await pool.query(
-    `SELECT COALESCE(SUM(amount_ugx - worker_commission_ugx), 0) as total
-       FROM washes WHERE settled_shift_id = $1 AND status = 'settled'`,
+    `SELECT COALESCE(SUM(${CASH_TO_HAND_IN_SQL}), 0) as total
+       FROM washes w WHERE w.settled_shift_id = $1 AND w.status = 'settled'`,
     [shiftId]
   );
   return Number(r.rows[0].total);
@@ -70,7 +83,14 @@ router.post('/open', requireRole('orgadmin', 'manager', 'worker'), async (req: R
     );
 
     res.status(201).json({ ok: true, data: result.rows[0] });
-  } catch (err) {
+  } catch (err: any) {
+    // Two opens at the same moment (the worker screen loading twice) both
+    // pass the check above; the one_open_shift_per_worker index stops the
+    // second. That is "already open", not a server error.
+    if (err?.code === '23505' && err?.constraint === 'one_open_shift_per_worker') {
+      next(createAppError(409, 'SHIFT_ALREADY_OPEN', 'You already have an open shift'));
+      return;
+    }
     next(err);
   }
 });
@@ -330,9 +350,9 @@ router.get('/', requireRole('orgadmin', 'manager'), async (req: Request, res: Re
     let query = `
       SELECT s.*, su.full_name as worker_name, b.name as branch_name,
         COALESCE((
-          -- Net of commission, for the same reason computeExpectedCash is:
-          -- this is what the manager should actually collect.
-          SELECT SUM(w.amount_ugx - w.worker_commission_ugx) FROM washes w
+          -- Same rule as computeExpectedCash: what the manager should
+          -- actually collect.
+          SELECT SUM(${CASH_TO_HAND_IN_SQL}) FROM washes w
           WHERE w.settled_shift_id = s.id AND w.status = 'settled'
         ), 0) AS live_expected_cash_ugx,
         COALESCE((

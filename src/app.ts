@@ -1,3 +1,6 @@
+// First: route errors from async handlers to the error handler instead of
+// crashing the process (see the file's own comment).
+import '@/middleware/asyncErrors';
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -40,6 +43,8 @@ import clientWashRouter from '@/modules/washes/clientWashRoutes';
 import reportRouter from '@/modules/reports/reportRoutes';
 import issueRouter from '@/modules/support/issueRoutes';
 import exceptionRouter from '@/modules/washes/exceptionRoutes';
+import settingsRouter from '@/modules/settings/settingsRoutes';
+import walletRouter from '@/modules/wallet/walletRoutes';
 
 export const logger = pino({
   name: 'carwash-api',
@@ -82,6 +87,8 @@ app.use('/api/v1', authenticate, requirePasswordChanged, catalogueRouter);
 app.use('/api/v1/prices', authenticate, requirePasswordChanged, priceRouter);
 app.use('/api/v1/shifts', authenticate, requirePasswordChanged, shiftRouter);
 app.use('/api/v1/worker-points', authenticate, requirePasswordChanged, workerPointsRouter);
+app.use('/api/v1/settings', authenticate, requirePasswordChanged, settingsRouter);
+app.use('/api/v1/wallet', authenticate, requirePasswordChanged, walletRouter);
 app.use('/api/v1/me/device', authenticate, requirePasswordChanged, deviceRouter);
 
 // Phase 4: Wash lifecycle
@@ -107,6 +114,14 @@ app.post('/api/v1/clients/:id/loyalty/adjust', authenticate, requirePasswordChan
 
     if (!reason || typeof wash_delta !== 'number' || typeof credit_delta !== 'number') {
       next(createAppError(422, 'VALIDATION', 'wash_delta, credit_delta, and reason are required'));
+      return;
+    }
+
+    // The client must belong to this organisation. Without this, any org
+    // admin could rewrite another company's customer's balance by id.
+    const owned = await pool.query(`SELECT 1 FROM clients WHERE id = $1 AND org_id = $2`, [clientId, orgId]);
+    if (owned.rows.length === 0) {
+      next(createAppError(404, 'NOT_FOUND', 'Client not found'));
       return;
     }
 
@@ -189,9 +204,14 @@ app.get('/api/v1/clients', authenticate, requirePasswordChanged, requireRole('or
       SELECT c.id, c.full_name, c.phone, c.status, c.created_at,
              COALESCE(la.wash_count, 0) as wash_count,
              COALESCE(la.free_wash_credits, 0) as free_wash_credits,
-             COALESCE(la.lifetime_washes, 0) as lifetime_washes
+             COALESCE(la.lifetime_washes, 0) as lifetime_washes,
+             -- Points (which replaced the stamp card) in THIS organisation's scheme.
+             COALESCE(cpa.balance, 0) as points_balance,
+             COALESCE(cpa.lifetime_earned, 0) as points_lifetime_earned,
+             (SELECT COUNT(*) FROM washes w WHERE w.client_id = c.id AND w.status = 'settled')::int as settled_washes
       FROM clients c
       LEFT JOIN loyalty_accounts la ON c.id = la.client_id
+      LEFT JOIN client_points_accounts cpa ON cpa.client_id = c.id AND cpa.org_id = c.org_id
       WHERE c.org_id = $1
     `;
     const params: any[] = [orgId];

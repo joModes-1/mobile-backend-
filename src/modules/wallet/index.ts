@@ -1,0 +1,225 @@
+import { PoolClient } from 'pg';
+
+/**
+ * Worker wallet — the ONLY module that writes wallet_accounts and
+ * wallet_ledger.
+ *
+ * The balance is what the business owes the worker. It goes negative when a
+ * worker is holding cash that belongs to the business, and comes back up
+ * when a manager confirms receiving it. Every function takes the caller's
+ * PoolClient so money moves inside the same transaction as the event that
+ * caused it — a settlement that rolls back takes its commission with it.
+ */
+
+export type WalletKind =
+  | 'commission' | 'cash_collected' | 'cash_handover' | 'reversal' | 'correction'
+  | 'withdrawal' | 'withdrawal_fee' | 'withdrawal_reversal' | 'adjust';
+
+export interface WalletAccount {
+  staff_id: string;
+  org_id: string;
+  balance_ugx: number;
+  lifetime_commission_ugx: number;
+  lifetime_withdrawn_ugx: number;
+}
+
+/** Error in the shape the global error handler reads. */
+export class WalletError extends Error {
+  constructor(public code: string, message: string, public statusCode = 422, public details?: unknown) {
+    super(message);
+  }
+}
+
+/**
+ * Commission on a wash: basis points of the FULL price, rounded down.
+ *
+ * Full price, not what the client handed over — a worker earns the same
+ * whether the client paid cash, mobile money or points, and the business
+ * absorbs the points discount and any payment fee. Rounded down so the
+ * worker is never credited a shilling the business didn't get.
+ */
+export function commissionFor(priceUgx: number, bp: number): number {
+  if (bp <= 0 || priceUgx <= 0) return 0;
+  return Math.floor((priceUgx * bp) / 10000);
+}
+
+function toAccount(row: any): WalletAccount {
+  return {
+    staff_id: row.staff_id,
+    org_id: row.org_id,
+    balance_ugx: Number(row.balance_ugx),
+    lifetime_commission_ugx: Number(row.lifetime_commission_ugx),
+    lifetime_withdrawn_ugx: Number(row.lifetime_withdrawn_ugx),
+  };
+}
+
+async function lockAccount(client: PoolClient, staffId: string, orgId: string): Promise<WalletAccount> {
+  await client.query(
+    `INSERT INTO wallet_accounts (staff_id, org_id) VALUES ($1, $2) ON CONFLICT (staff_id) DO NOTHING`,
+    [staffId, orgId]
+  );
+  const r = await client.query(
+    `SELECT staff_id, org_id, balance_ugx, lifetime_commission_ugx, lifetime_withdrawn_ugx
+       FROM wallet_accounts WHERE staff_id = $1 FOR UPDATE`,
+    [staffId]
+  );
+  return toAccount(r.rows[0]);
+}
+
+/** Read-only account for screens; no row yet reads as an empty wallet. */
+export async function getAccount(client: PoolClient | any, staffId: string, orgId: string): Promise<WalletAccount> {
+  const r = await client.query(
+    `SELECT staff_id, org_id, balance_ugx, lifetime_commission_ugx, lifetime_withdrawn_ugx
+       FROM wallet_accounts WHERE staff_id = $1`,
+    [staffId]
+  );
+  return r.rows[0]
+    ? toAccount(r.rows[0])
+    : { staff_id: staffId, org_id: orgId, balance_ugx: 0, lifetime_commission_ugx: 0, lifetime_withdrawn_ugx: 0 };
+}
+
+/** Writes one ledger row and moves the cached balance with it. */
+export async function post(
+  client: PoolClient,
+  opts: {
+    staffId: string; orgId: string; kind: WalletKind; amountUgx: number;
+    washId?: string | null; reason?: string | null; createdBy?: string | null;
+  }
+): Promise<WalletAccount> {
+  const account = await lockAccount(client, opts.staffId, opts.orgId);
+  const after = account.balance_ugx + opts.amountUgx;
+
+  await client.query(
+    `INSERT INTO wallet_ledger (staff_id, org_id, wash_id, kind, amount_ugx, balance_after_ugx, reason, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+    [opts.staffId, opts.orgId, opts.washId ?? null, opts.kind, opts.amountUgx, after,
+     opts.reason ?? null, opts.createdBy ?? null]
+  );
+
+  // Lifetime commission follows commission and its undoing; withdrawals
+  // are tracked for Phase 6.
+  const commissionDelta = opts.kind === 'commission' ? opts.amountUgx : 0;
+  const withdrawnDelta =
+    opts.kind === 'withdrawal' ? -opts.amountUgx
+    : opts.kind === 'withdrawal_reversal' ? -opts.amountUgx
+    : 0;
+
+  const r = await client.query(
+    `UPDATE wallet_accounts
+        SET balance_ugx = $2,
+            lifetime_commission_ugx = lifetime_commission_ugx + $3,
+            lifetime_withdrawn_ugx = GREATEST(0, lifetime_withdrawn_ugx + $4),
+            updated_at = now()
+      WHERE staff_id = $1
+      RETURNING staff_id, org_id, balance_ugx, lifetime_commission_ugx, lifetime_withdrawn_ugx`,
+    [opts.staffId, after, commissionDelta, withdrawnDelta]
+  );
+  return toAccount(r.rows[0]);
+}
+
+/**
+ * The money side of a settlement.
+ *
+ * Commission goes to whoever WASHED the car (the starter). The cash goes
+ * against whoever TOOK it (the settler). Usually the same person, so the
+ * net is −(cash − commission): they keep their cut out of the notes and owe
+ * the rest. On a handover the two land on different wallets, which is
+ * exactly right — the settler is the one holding the notes.
+ */
+export async function recordSettlement(
+  client: PoolClient,
+  opts: { washId: string; orgId: string; starterId: string; settlerId: string; commissionUgx: number; cashUgx: number }
+): Promise<{ starter: WalletAccount | null; settler: WalletAccount | null }> {
+  let starter: WalletAccount | null = null;
+  let settler: WalletAccount | null = null;
+  if (opts.commissionUgx > 0) {
+    starter = await post(client, {
+      staffId: opts.starterId, orgId: opts.orgId, kind: 'commission', amountUgx: opts.commissionUgx, washId: opts.washId,
+    });
+  }
+  if (opts.cashUgx > 0) {
+    settler = await post(client, {
+      staffId: opts.settlerId, orgId: opts.orgId, kind: 'cash_collected', amountUgx: -opts.cashUgx, washId: opts.washId,
+      reason: 'Cash collected from client',
+    });
+  }
+  if (starter && opts.starterId === opts.settlerId && settler) starter = settler;
+  return { starter, settler };
+}
+
+/**
+ * Undo a reversed wash's money: for every worker it touched, post the
+ * opposite of everything the wash moved for them (commission, cash and any
+ * corrections). No-op for a worker already reversed.
+ */
+export async function reverseForWash(
+  client: PoolClient,
+  opts: { washId: string; reason?: string | null; createdBy?: string | null }
+): Promise<Array<{ staff_id: string; amount_ugx: number }>> {
+  const nets = await client.query(
+    `SELECT staff_id, org_id, SUM(amount_ugx) AS net
+       FROM wallet_ledger
+      WHERE wash_id = $1 AND kind IN ('commission', 'cash_collected', 'correction')
+        AND NOT EXISTS (
+          SELECT 1 FROM wallet_ledger r
+           WHERE r.wash_id = $1 AND r.kind = 'reversal' AND r.staff_id = wallet_ledger.staff_id)
+      GROUP BY staff_id, org_id`,
+    [opts.washId]
+  );
+  const out: Array<{ staff_id: string; amount_ugx: number }> = [];
+  for (const row of nets.rows) {
+    const net = Number(row.net);
+    if (net === 0) continue;
+    await post(client, {
+      staffId: row.staff_id, orgId: row.org_id, kind: 'reversal', amountUgx: -net, washId: opts.washId,
+      reason: opts.reason ?? 'Wash reversed', createdBy: opts.createdBy,
+    });
+    out.push({ staff_id: row.staff_id, amount_ugx: -net });
+  }
+  return out;
+}
+
+/**
+ * A manager corrected a settled wash's price. Commission follows the new
+ * price; if it was a cash wash, what the settler owes follows the new cash
+ * amount. Posts only the differences.
+ */
+export async function correctForWash(
+  client: PoolClient,
+  opts: {
+    washId: string; orgId: string; starterId: string; settlerId: string;
+    commissionDelta: number; cashDelta: number; reason?: string | null; createdBy?: string | null;
+  }
+): Promise<void> {
+  const deltas = new Map<string, number>();
+  if (opts.commissionDelta !== 0) deltas.set(opts.starterId, (deltas.get(opts.starterId) ?? 0) + opts.commissionDelta);
+  if (opts.cashDelta !== 0) deltas.set(opts.settlerId, (deltas.get(opts.settlerId) ?? 0) - opts.cashDelta);
+  for (const [staffId, amount] of deltas) {
+    if (amount === 0) continue;
+    await post(client, {
+      staffId, orgId: opts.orgId, kind: 'correction', amountUgx: amount, washId: opts.washId,
+      reason: opts.reason ?? 'Wash corrected', createdBy: opts.createdBy,
+    });
+  }
+}
+
+/**
+ * A manager confirms receiving cash from a worker. Partial amounts are
+ * fine; more than the worker owes is refused — over-confirming would hand
+ * the worker a positive, withdrawable balance for money that never existed.
+ */
+export async function cashHandover(
+  client: PoolClient,
+  opts: { staffId: string; orgId: string; amountUgx: number; by: string; note?: string | null }
+): Promise<WalletAccount> {
+  const account = await lockAccount(client, opts.staffId, opts.orgId);
+  const owed = Math.max(0, -account.balance_ugx);
+  if (owed === 0) throw new WalletError('NOTHING_OWED', 'This worker does not owe any cash', 409);
+  if (opts.amountUgx > owed) {
+    throw new WalletError('MORE_THAN_OWED', `This worker only owes UGX ${owed}`, 422, { owed_ugx: owed });
+  }
+  return post(client, {
+    staffId: opts.staffId, orgId: opts.orgId, kind: 'cash_handover', amountUgx: opts.amountUgx,
+    reason: opts.note ?? 'Cash received by manager', createdBy: opts.by,
+  });
+}

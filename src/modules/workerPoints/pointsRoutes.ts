@@ -103,6 +103,15 @@ router.get('/leaderboard', async (req: Request, res: Response, next: NextFunctio
       branchId = req.actor.branch_id ?? null;
     }
 
+    // period=week|month ranks by points EARNED in that window (Monday-based
+    // week, calendar month) — "best this week". period=all (the default,
+    // and what this endpoint always returned) ranks by lifetime points.
+    const period = String(req.query.period || 'all');
+    if (!['week', 'month', 'all'].includes(period)) {
+      next(createAppError(400, 'VALIDATION_ERROR', 'period must be week, month or all'));
+      return;
+    }
+
     const params: any[] = [orgId];
     let branchClause = '';
     if (branchId) {
@@ -110,24 +119,43 @@ router.get('/leaderboard', async (req: Request, res: Response, next: NextFunctio
       branchClause = `AND su.branch_id = $${params.length}`;
     }
 
+    // Earn, bonus and reversal rows net out to what was really earned in
+    // the window; redemptions spend points but don't undo experience.
+    const periodPoints = period === 'all' ? null : `
+      COALESCE((SELECT SUM(l.points_delta) FROM worker_points_ledger l
+                 WHERE l.staff_id = su.id AND l.entry_type IN ('earn', 'bonus', 'reversal')
+                   AND l.created_at >= date_trunc('${period}', CURRENT_DATE)), 0)`;
+    const periodWashes = period === 'all' ? null : `
+      (SELECT COUNT(*) FROM worker_points_ledger l
+        WHERE l.staff_id = su.id AND l.entry_type = 'earn'
+          AND l.created_at >= date_trunc('${period}', CURRENT_DATE))`;
+
     const rows = await pool.query(
       `SELECT su.id, su.full_name, su.username, b.code AS branch_code,
               COALESCE(a.points_balance, 0)  AS points_balance,
               COALESCE(a.lifetime_earned, 0) AS lifetime_earned,
-              COALESCE(a.washes_credited, 0) AS washes_credited
+              COALESCE(a.washes_credited, 0) AS washes_credited,
+              ${periodPoints ?? 'COALESCE(a.lifetime_earned, 0)'}::int AS points,
+              ${periodWashes ?? 'COALESCE(a.washes_credited, 0)'}::int AS washes
          FROM staff_users su
          LEFT JOIN worker_points_accounts a ON a.staff_id = su.id
          LEFT JOIN branches b ON b.id = su.branch_id
         WHERE su.org_id = $1 AND su.status = 'active'
           AND su.role IN ('worker', 'manager') ${branchClause}
-        ORDER BY COALESCE(a.lifetime_earned, 0) DESC, su.full_name
+        ORDER BY points DESC, su.full_name
         LIMIT 50`,
       params
     );
 
+    const ranked = rows.rows.map((r: any, i: number) => ({ ...r, rank: i + 1 }));
     res.json({
       ok: true,
-      data: rows.rows.map((r: any, i: number) => ({ ...r, rank: i + 1 })),
+      data: ranked,
+      // The caller's own standing, so a worker outside the top rows still
+      // sees where they are. Kept beside `data` so existing readers of the
+      // array are unaffected.
+      period,
+      me: ranked.find((r: any) => r.id === req.actor!.sub) ?? null,
     });
   } catch (err) {
     next(err);

@@ -2,14 +2,13 @@
  * Phase 12 — client-initiated (self-service) wash booking.
  *
  * The model is: a client scans a branch's wall QR and books the wash
- * themselves. The server then auto-assigns the first free worker at that
- * branch (open shift + zero in_progress washes) — nobody taps "Accept" in
- * the normal case. If nobody is free, the wash stays 'requested' and the
- * existing manual POST /:id/accept is the fallback a worker uses once they
- * finish their current car.
+ * themselves. The booking waits in 'requested' for its accept window; the
+ * first eligible worker to tap Accept gets it, and if nobody does the
+ * dispatcher assigns it (modules/dispatch — the timer itself is covered by
+ * v2-phase3-test). Eligible = nobody on site has fewer cars.
  *
- * This suite covers: the branch-QR resolve endpoint, booking + auto-assign,
- * the manual-accept fallback and its race-safety, and confirms the existing
+ * This suite covers: the branch-QR resolve endpoint, booking, accept with
+ * the fewest-jobs rule and its race-safety, and confirms the existing
  * wash-done/settle machinery needed zero changes to handle a wash that
  * started this way.
  *
@@ -121,7 +120,7 @@ async function main() {
     check('staff actor rejected (client-only route)', staffCannotUseThis.status === 403, 'status ' + staffCannotUseThis.status);
   });
 
-  await act('Act 3 — client books a wash and it is auto-assigned', async () => {
+  await act('Act 3 — client books a wash; it waits, then a worker accepts', async () => {
     if (!branchId) { check('prerequisites', false); return; }
 
     const prices = await call('GET', `/me/washes/prices?branch_id=${branchId}`, undefined, client);
@@ -135,22 +134,29 @@ async function main() {
     }, client);
     washId = book.body?.data?.wash_id;
 
-    // Both workers were just freed in Act 1, so the server should always
-    // find one — this is the primary path now, not a maybe.
-    check('booking is immediately in_progress (auto-assigned, not left requested)',
-      book.status === 201 && book.body?.data?.status === 'in_progress',
+    check('booking waits in requested with an auto-assign time',
+      book.status === 201 && book.body?.data?.status === 'requested' && !!book.body?.data?.auto_assign_at,
       'status ' + book.status + ' ' + JSON.stringify(book.body));
 
     const dupe = await call('POST', '/me/washes', {
       branch_id: branchId, vehicle_class_id: vcId, service_id: svcId,
     }, client);
-    check('a second booking is refused while the first is still active (now covers in_progress, not just requested)',
+    check('a second booking is refused while the first is still active',
       dupe.status === 409 && dupe.body?.error?.code === 'ALREADY_REQUESTED',
       'status ' + dupe.status + ' ' + JSON.stringify(dupe.body));
 
+    const queue = await call('GET', '/washes/queue', undefined, joseph);
+    const row = (queue.body?.data?.requested || []).find((w: any) => w.id === washId);
+    check('workers see it with a countdown and can accept',
+      !!row && typeof row.seconds_left === 'number' && row.can_accept === true, JSON.stringify(row));
+
+    const accept = await call('POST', `/washes/${washId}/accept`, undefined, joseph);
+    check('a free worker accepts it', accept.status === 200 && accept.body?.data?.status === 'in_progress',
+      'status ' + accept.status + ' ' + JSON.stringify(accept.body));
+
+    const josephId = (await call('GET', '/me', undefined, joseph)).body?.data?.id;
     const detail = await call('GET', `/washes/${washId}`, undefined, orgadmin);
-    check('the assigned worker is one of the two free ones (joseph or musa)',
-      detail.body?.data?.started_by_worker_id === musaId || !!detail.body?.data?.started_by_worker_id,
+    check('the wash is now joseph\'s', detail.body?.data?.started_by_worker_id === josephId,
       JSON.stringify(detail.body?.data?.started_by_worker_id));
 
     const active = await call('GET', '/me/washes/active', undefined, client);
@@ -172,68 +178,44 @@ async function main() {
     check('appears in the plain wash list', !!found, 'list length ' + (list.body?.data || []).length);
   });
 
-  await act('Act 5 — manual accept fallback: race-safety when nobody is auto-assigned', async () => {
-    // To exercise the fallback/race path deliberately, book a SECOND wash
-    // after making both workers busy (the one from Act 3 occupies one of
-    // them already) — book, then free the other worker's wash too so BOTH
-    // are busy, guaranteeing this new booking stays 'requested'.
+  await act('Act 5 — the fewest-jobs rule, and accept race-safety', async () => {
     if (!branchId) { check('prerequisites', false); return; }
+    // State coming in: joseph holds Act 3's wash (1 car), musa has none.
+    const second = await signInByPhone('+2567' + String(Date.now() + 2).slice(-8));
+    const b2 = await call('POST', '/me/washes', {
+      branch_id: branchId, vehicle_class_id: vcId, service_id: svcId, plate: 'P12 SECOND',
+    }, second);
+    const wash2 = b2.body?.data?.wash_id;
 
-    // Act 3's booking already occupies one of joseph/musa. Book one more
-    // client wash here as filler — auto-assign will take whichever worker
-    // is still free, leaving both busy for the actual test below.
-    const fillerPhone = '+2567' + String(Date.now() + 1).slice(-8);
-    const fillerClient = await signInByPhone(fillerPhone);
-    const filler = await call('POST', '/me/washes', {
-      branch_id: branchId, vehicle_class_id: vcId, service_id: svcId, plate: 'P12 FILLER',
-    }, fillerClient);
-    // Now book the wash this act actually tests — with both workers busy
-    // (Act 3's + this filler), it must stay 'requested'.
-    const secondClientPhone = '+2567' + String(Date.now() + 2).slice(-8);
-    const secondClient = await signInByPhone(secondClientPhone);
-    const requestedBooking = await call('POST', '/me/washes', {
+    const josephTry = await call('POST', `/washes/${wash2}/accept`, undefined, joseph);
+    check('joseph (1 car) cannot take it while musa has none',
+      josephTry.status === 409 && josephTry.body?.error?.code === 'WORKER_BUSY'
+        && josephTry.body?.error?.details?.your_jobs === 1 && josephTry.body?.error?.details?.fewest_jobs === 0,
+      'status ' + josephTry.status + ' ' + JSON.stringify(josephTry.body));
+
+    const musaTry = await call('POST', `/washes/${wash2}/accept`, undefined, musa);
+    check('musa (no cars) can', musaTry.status === 200, 'status ' + musaTry.status + ' ' + JSON.stringify(musaTry.body));
+
+    // Now both hold one — both are eligible, and they race for the next.
+    const third = await signInByPhone('+2567' + String(Date.now() + 3).slice(-8));
+    const b3 = await call('POST', '/me/washes', {
       branch_id: branchId, vehicle_class_id: vcId, service_id: svcId, plate: 'P12 RACE',
-    }, secondClient);
-    const raceWashId = requestedBooking.body?.data?.wash_id;
+    }, third);
+    const wash3 = b3.body?.data?.wash_id;
+    const [a, b] = await Promise.all([
+      call('POST', `/washes/${wash3}/accept`, undefined, joseph),
+      call('POST', `/washes/${wash3}/accept`, undefined, musa),
+    ]);
+    const statuses = [a.status, b.status].sort();
+    const loser = a.status === 200 ? b : a;
+    check('exactly one of two simultaneous accepts wins',
+      statuses[0] === 200 && statuses[1] === 409 && loser.body?.error?.code === 'ALREADY_CLAIMED',
+      JSON.stringify([a.body, b.body]).slice(0, 300));
 
-    check('with both workers busy, booking stays requested (no auto-assign possible)',
-      requestedBooking.status === 201 && requestedBooking.body?.data?.status === 'requested',
-      'status ' + requestedBooking.status + ' ' + JSON.stringify(requestedBooking.body));
-
-    if (!raceWashId) { check('prerequisites for race', false); return; }
-
-    // Both workers are busy, so a manual accept attempt from either must be
-    // rejected with WORKER_BUSY, not silently succeed.
-    const attempt = await call('POST', `/washes/${raceWashId}/accept`, undefined, joseph);
-    check('accept correctly refuses a busy worker', attempt.status === 409 && attempt.body?.error?.code === 'WORKER_BUSY',
-      'status ' + attempt.status + ' ' + JSON.stringify(attempt.body));
-
-    // Free up whichever worker is NOT holding Act 3's `washId` — that one
-    // must stay untouched, pristine, for Act 6. The filler wash (plate
-    // 'P12 FILLER') is what that other worker is holding, identified by
-    // plate rather than "first in the list" so this can never accidentally
-    // touch washId regardless of assignment order.
-    const holderDetail = await call('GET', `/washes/${washId}`, undefined, orgadmin);
-    const act3Holder = holderDetail.body?.data?.started_by_worker_id;
-    const freeUpToken = act3Holder === musaId ? joseph : musa;
-
-    const queueNow = await call('GET', '/washes/queue', undefined, freeUpToken);
-    const fillerCar = (queueNow.body?.data?.washing || []).find((w: any) => w.plate === 'P12 FILLER');
-    check('the filler car is found on the other worker\'s queue', !!fillerCar,
-      JSON.stringify(queueNow.body?.data?.washing));
-    if (fillerCar) {
-      await call('POST', `/washes/${fillerCar.id}/wash-done`, undefined, freeUpToken);
-      await call('POST', `/washes/${fillerCar.id}/settle`, { unverified_reason: 'no_app', payment_method: 'cash' }, freeUpToken);
+    // Clean up — washId (Act 3's) is deliberately untouched for Act 6.
+    for (const id of [wash2, wash3]) {
+      await call('POST', `/washes/${id}/cancel`, { reason: 'other', note: 'phase12 cleanup' }, orgadmin);
     }
-
-    const accept = await call('POST', `/washes/${raceWashId}/accept`, undefined, freeUpToken);
-    check('now-free worker can accept the fallback request', accept.status === 200,
-      'status ' + accept.status + ' ' + JSON.stringify(accept.body));
-
-    // Clean up: finish this one too so it doesn't leak into later acts.
-    // washId (Act 3's) is deliberately untouched here.
-    await call('POST', `/washes/${raceWashId}/wash-done`, undefined, freeUpToken);
-    await call('POST', `/washes/${raceWashId}/settle`, { unverified_reason: 'no_app', payment_method: 'cash' }, freeUpToken);
   });
 
   await act('Act 6 — lifecycle unchanged: wash-done, payment-intent, settle', async () => {

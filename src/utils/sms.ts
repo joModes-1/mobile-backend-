@@ -88,11 +88,21 @@ export async function sendSms(to: string, message: string): Promise<SmsResult> {
   const url = creds.username === 'sandbox' ? AT_URL_SANDBOX : AT_URL_LIVE;
 
   const MAX_ATTEMPTS = 3;
+  // Sign-in waits on this call, so it is time-boxed: each attempt gets at
+  // most 6 s and all attempts together 10 s. Without a limit a hung gateway
+  // held the person on "Continue" for as long as it liked.
+  const ATTEMPT_TIMEOUT_MS = 6000;
+  const deadline = Date.now() + 10000;
   let lastError = 'unknown error';
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) { lastError = lastError === 'unknown error' ? 'timed out' : lastError; break; }
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), Math.min(ATTEMPT_TIMEOUT_MS, remaining));
     try {
       const res = await fetch(url, {
+        signal: ctrl.signal,
         method: 'POST',
         headers: {
           apiKey: creds.apiKey,
@@ -134,11 +144,13 @@ export async function sendSms(to: string, message: string): Promise<SmsResult> {
         || `HTTP ${res.status}`;
       break;
     } catch (e: any) {
-      lastError = e?.message || 'network error';
+      lastError = e?.name === 'AbortError' ? 'timed out' : (e?.message || 'network error');
       if (attempt < MAX_ATTEMPTS) {
         await new Promise((r) => setTimeout(r, 400 * attempt));
         continue;
       }
+    } finally {
+      clearTimeout(timer);
     }
   }
 

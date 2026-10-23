@@ -81,22 +81,6 @@ export async function ensureAccount(
   );
 }
 
-/**
- * What a wash is worth to the worker who settled it.
- *
- * A flat component so a cheap job is still worth doing properly, plus a
- * value component so a bigger job pays more. An org that wants pure
- * flat-rate sets points_per_amount to 0.
- */
-export function pointsForWash(cfg: WorkerPointsConfig, amountUgx: number): number {
-  if (!cfg.active) return 0;
-  if (amountUgx < cfg.min_amount_ugx) return 0;
-  const steps = cfg.amount_step_ugx > 0
-    ? Math.floor(amountUgx / cfg.amount_step_ugx)
-    : 0;
-  return cfg.points_per_wash + steps * cfg.points_per_amount;
-}
-
 /** Writes one ledger row and moves the cached balance with it. */
 async function post(
   client: PoolClient,
@@ -172,18 +156,19 @@ export async function awardForSettlement(
     staffId: string;
     orgId: string;
     washId: string;
-    amountUgx: number;
-    isRedemption: boolean;
+    /**
+     * The points frozen onto the wash at booking — its wash type's
+     * `worker_points_awarded` from Settings. Earned on every wash (paid with
+     * points, a free promo, a credit): points are experience, and the work
+     * was the same.
+     */
+    points: number;
   }
 ): Promise<{ points: number; account: WorkerPointsAccount } | null> {
   const cfg = await getConfig(client, opts.orgId);
   if (!cfg || !cfg.active) return null;
 
-  // A free wash moves no money, so it pays no points. The worker still did
-  // the work, which is why washes_credited counts it below.
-  if (opts.isRedemption) return null;
-
-  const points = pointsForWash(cfg, opts.amountUgx);
+  const points = opts.points;
   if (points <= 0) return null;
 
   // The unique index on (wash_id, entry_type) is what actually guarantees

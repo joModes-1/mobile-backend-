@@ -162,6 +162,10 @@ const createServiceSchema = z.object({
   description: z.string().optional(),
   is_default: z.boolean().default(false),
   earns_point: z.boolean().default(true),
+  // Client points a wash of this type gives; 0 until the owner sets it.
+  client_points_awarded: z.number().int().min(0).max(100_000).default(0),
+  // Points the worker who washes it earns; 0 until the owner sets it.
+  worker_points_awarded: z.number().int().min(0).max(100_000).default(0),
   branch_id: z.string().uuid().nullable().optional(),
 });
 
@@ -170,6 +174,8 @@ const updateServiceSchema = z.object({
   description: z.string().optional(),
   is_default: z.boolean().optional(),
   earns_point: z.boolean().optional(),
+  client_points_awarded: z.number().int().min(0).max(100_000).optional(),
+  worker_points_awarded: z.number().int().min(0).max(100_000).optional(),
   active: z.boolean().optional(),
 });
 
@@ -216,7 +222,7 @@ router.get('/services', requireRole('orgadmin', 'manager'), async (req: Request,
     const scope = catalogueScope(req.actor!, req.query.branch_id as string | undefined, 's', 2);
 
     const result = await pool.query(
-      `SELECT s.id, s.name, s.description, s.is_default, s.earns_point, s.active,
+      `SELECT s.id, s.name, s.description, s.is_default, s.earns_point, s.client_points_awarded, s.worker_points_awarded, s.active,
               s.created_at, s.branch_id, b.name AS branch_name
        FROM services s
        LEFT JOIN branches b ON b.id = s.branch_id
@@ -273,9 +279,9 @@ router.post('/services', requireRole('orgadmin', 'manager'), async (req: Request
       }
 
       const result = await client.query(
-        `INSERT INTO services (org_id, branch_id, name, description, is_default, earns_point)
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-        [orgId, branchId, data.name, data.description || null, data.is_default, data.earns_point]
+        `INSERT INTO services (org_id, branch_id, name, description, is_default, earns_point, client_points_awarded, worker_points_awarded)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+        [orgId, branchId, data.name, data.description || null, data.is_default, data.earns_point, data.client_points_awarded, data.worker_points_awarded]
       );
 
       await client.query('COMMIT');
@@ -333,6 +339,8 @@ router.patch('/services/:id', requireRole('orgadmin', 'manager'), async (req: Re
     if (data.description !== undefined) { updates.push(`description = $${paramIndex++}`); values.push(data.description); }
     if (data.is_default !== undefined) { updates.push(`is_default = $${paramIndex++}`); values.push(data.is_default); }
     if (data.earns_point !== undefined) { updates.push(`earns_point = $${paramIndex++}`); values.push(data.earns_point); }
+    if (data.client_points_awarded !== undefined) { updates.push(`client_points_awarded = ${paramIndex++}`); values.push(data.client_points_awarded); }
+    if (data.worker_points_awarded !== undefined) { updates.push(`worker_points_awarded = ${paramIndex++}`); values.push(data.worker_points_awarded); }
     if (data.active !== undefined) { updates.push(`active = $${paramIndex++}`); values.push(data.active); }
 
     if (updates.length === 0) {

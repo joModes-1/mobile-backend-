@@ -34,12 +34,18 @@ const envSchema = z.object({
   TEST_MODE: z.enum(['true', 'false', '1', '0', '']).default('false')
     .transform((v) => v === 'true' || v === '1'),
 
-  // Name-lookup-by-phone, for a brand-new client's sign-up. Both optional —
-  // no provider is wired in yet, so without them a new client is simply
-  // called "Customer" until they rename themselves, exactly as before this
-  // was added. Set both once a provider is chosen; nothing else changes.
-  NAME_LOOKUP_URL: z.string().optional(),
-  NAME_LOOKUP_API_KEY: z.string().optional(),
+  // Name lookup by phone (modules/nameLookup): a new client's registered
+  // name from MTN MoMo or Airtel Money. All optional — a network with no
+  // credentials is simply skipped, and with neither configured new clients
+  // get a generated name (user###).
+  MTN_MOMO_BASE_URL: z.string().optional(),
+  MTN_MOMO_SUBSCRIPTION_KEY: z.string().optional(),
+  MTN_MOMO_API_USER: z.string().optional(),
+  MTN_MOMO_API_KEY: z.string().optional(),
+  MTN_MOMO_TARGET_ENV: z.string().optional(),
+  AIRTEL_BASE_URL: z.string().optional(),
+  AIRTEL_CLIENT_ID: z.string().optional(),
+  AIRTEL_CLIENT_SECRET: z.string().optional(),
 });
 
 export type Env = z.infer<typeof envSchema>;

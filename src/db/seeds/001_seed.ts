@@ -192,9 +192,12 @@ export async function seed(knex: Knex): Promise<void> {
       'services',
       { sql: 'org_id = ? AND lower(name) = lower(?) AND branch_id IS NULL', params: [orgId, svc.name] },
       {
-        columns: 'org_id, name, is_default, earns_point',
-        values: '?, ?, ?, ?',
-        params: [orgId, svc.name, svc.is_default && !orgHasDefault, svc.earns_point],
+        // Wash types that earn points start at 10 (worth 1,000 UGX at the
+        // default 100 per point); the owner tunes both in Settings.
+        // and every wash type gives the worker 10 points to start with.
+        columns: 'org_id, name, is_default, earns_point, client_points_awarded, worker_points_awarded',
+        values: '?, ?, ?, ?, ?, ?',
+        params: [orgId, svc.name, svc.is_default && !orgHasDefault, svc.earns_point, svc.earns_point ? 10 : 0, 10],
       },
       `service: ${svc.name}`
     );

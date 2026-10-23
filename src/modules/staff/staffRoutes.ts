@@ -179,8 +179,12 @@ router.get('/:id', requireRole('orgadmin', 'manager'), async (req: Request, res:
               s.branch_id, b.name as branch_name
        FROM staff_users s
        LEFT JOIN branches b ON s.branch_id = b.id
-       WHERE s.id = $1 AND s.org_id = $2`,
-      [id, orgId]
+       WHERE s.id = $1 AND s.org_id = $2
+         AND ($3::boolean OR s.branch_id = $4)`,
+      // A manager sees their own branch only, the same rule GET /staff
+      // applies to the list — this detail route used to skip it, so a
+      // manager could open any colleague's record in the organisation.
+      [id, orgId, req.actor!.role === 'orgadmin', req.actor!.branch_id ?? null]
     );
 
     if (result.rows.length === 0) {

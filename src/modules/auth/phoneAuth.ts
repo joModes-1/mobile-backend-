@@ -6,7 +6,7 @@ import { getPool } from '@/db';
 import { signAccessToken, signRefreshToken } from '@/utils/jwt';
 import { createAppError } from '@/middleware/errorHandler';
 import { sendOtpSms, normalizeUgPhone, displayUgPhone } from '@/utils/sms';
-import { lookupNameByPhone } from '@/utils/nameLookup';
+import { resolveName, generatedName } from '@/modules/nameLookup';
 import { getEnv } from '@/config';
 
 const router = Router();
@@ -195,8 +195,39 @@ router.post('/verify', async (req: Request, res: Response, next: NextFunction) =
       return;
     }
 
+    // A brand-new number becomes a client, and a client never types their
+    // name: it comes from MTN / Airtel, or is made up (modules/nameLookup).
+    // Looked up BEFORE the transaction — with retries across two networks
+    // it can take seconds, and a transaction must not sit open on a
+    // phone company's API.
+    let lookedUpName: string | null = null;
+    if (!data.full_name?.trim()) {
+      const known = await conn.query(
+        `SELECT 1 FROM platform_admins WHERE phone = $1
+         UNION ALL SELECT 1 FROM staff_users WHERE phone = $1
+         UNION ALL SELECT 1 FROM clients WHERE phone = $1
+         LIMIT 1`,
+        [phone]
+      );
+      if (known.rows.length === 0) {
+        const result = await resolveName(phone);
+        lookedUpName = result.name;
+        console.log(`[NAME] new client name from ${result.source}`, result.attempts);
+      }
+    }
+
     await conn.query('BEGIN');
-    await conn.query('UPDATE otp_codes SET consumed_at = now() WHERE id = $1', [otp.id]);
+    // Conditional, so the same code used twice at once (a double-tap, made
+    // likelier by the lookup above) can only sign in once.
+    const consumed = await conn.query(
+      'UPDATE otp_codes SET consumed_at = now() WHERE id = $1 AND consumed_at IS NULL RETURNING id',
+      [otp.id]
+    );
+    if (consumed.rows.length === 0) {
+      await conn.query('ROLLBACK');
+      next(createAppError(400, 'OTP_NOT_FOUND', 'That code was already used. Request a new one.'));
+      return;
+    }
 
     // ── Platform admin wins the number first — the most privileged tier ──
     const platformRow = (await conn.query(
@@ -309,12 +340,10 @@ router.post('/verify', async (req: Request, res: Response, next: NextFunction) =
       const orgId = orgResult.rows[0].id;
       const local = phone.replace('+256', '0');
 
-      // The client's own app no longer asks for a name at sign-up — this is
-      // the only chance to get one before 'Customer' sticks until they set
-      // it themselves in Profile. lookupNameByPhone is a no-op returning
-      // null until a provider is configured (see its own doc comment); this
-      // stays exactly as safe as sign-up already was in that case.
-      const resolvedName = data.full_name?.trim() || (await lookupNameByPhone(phone));
+      // Looked up before the transaction (see above). The generated
+      // fallback covers the one case it wasn't: the number was claimed by
+      // someone else between that check and here.
+      const resolvedName = data.full_name?.trim() || lookedUpName || generatedName();
 
       row = (await conn.query(
         `INSERT INTO clients
@@ -322,7 +351,7 @@ router.post('/verify', async (req: Request, res: Response, next: NextFunction) =
             username, email, email_verified, password_hash)
          VALUES ($1, $2, $3, true, $4, $5, false, NULL)
          RETURNING id, org_id, full_name`,
-        [orgId, resolvedName || 'Customer', phone, `u${local}`, `${local}@phone.local`]
+        [orgId, resolvedName, phone, `u${local}`, `${local}@phone.local`]
       )).rows[0];
     } else {
       await conn.query(

@@ -6,6 +6,9 @@ import { requireRole, getOrgId } from '@/middleware/requireRole';
 import { consumeToken, hashToken } from '@/modules/tokens/tokenRoutes';
 import { processSettlement, ensureAccount, hasArmedPromo, redeemPromo } from '@/modules/loyalty';
 import { awardForSettlement as awardWorkerPoints } from '@/modules/workerPoints';
+import { awardForSettlement as awardClientPoints, refundForWash as refundClientPoints } from '@/modules/clientPoints';
+import { commissionFor, recordSettlement as recordWalletSettlement } from '@/modules/wallet';
+import { acceptCheck, requiredPointsFor, dispatchOverdue, getConfig as getDispatchConfig } from '@/modules/dispatch';
 import { notify } from '@/modules/notify';
 import { generateReceiptNo } from '@/utils/receiptNo';
 
@@ -27,61 +30,8 @@ async function getOpenShift(pool: any, workerId: string, branchId: string): Prom
   return r.rows.length > 0 ? r.rows[0] : null;
 }
 
-/**
- * Auto-assigns a client's freshly booked wash to the first free worker at
- * that branch — "free" meaning an open shift and zero washes already
- * in_progress. Called right after a client's booking commits, so a wash
- * moves straight from 'requested' to 'in_progress' with no worker having
- * to tap anything, matching the wall-mounted-QR self-service model: a
- * worker is simply picked the moment a client scans in, if one is free.
- *
- * If nobody is free, the wash stays 'requested' and falls back to the
- * existing manual POST /:id/accept path — a worker finishing their current
- * car can still pick it up from the request list once they are free.
- *
- * Race-safe the same way /accept already is: the actual claim is one
- * conditional UPDATE, so two calls racing (this auto-assign and a manual
- * accept, or two auto-assigns from a burst of simultaneous bookings)
- * cannot both win.
- */
-export async function tryAutoAssign(pool: any, washId: string, branchId: string): Promise<{ workerId: string; jobNo: string } | null> {
-  // Oldest-shift-first is an arbitrary but stable tie-break — any free
-  // worker is equally correct, this just keeps the pick deterministic
-  // rather than whatever order Postgres happens to return.
-  const candidates = await pool.query(
-    `SELECT s.worker_id, s.id AS shift_id
-       FROM shifts s
-      WHERE s.branch_id = $1 AND s.status = 'open'
-        AND NOT EXISTS (
-          SELECT 1 FROM washes w
-           WHERE w.started_by_worker_id = s.worker_id AND w.status = 'in_progress'
-        )
-      ORDER BY s.opened_at ASC`,
-    [branchId]
-  );
-
-  for (const candidate of candidates.rows) {
-    const claimed = await pool.query(
-      `UPDATE washes
-          SET status = 'in_progress', started_by_worker_id = $1, started_shift_id = $2,
-              started_at = now(), updated_at = now()
-        WHERE id = $3 AND branch_id = $4
-          AND status = 'requested' AND started_by_worker_id IS NULL
-        RETURNING job_no`,
-      [candidate.worker_id, candidate.shift_id, washId, branchId]
-    );
-    if (claimed.rows.length > 0) {
-      return { workerId: candidate.worker_id, jobNo: claimed.rows[0].job_no };
-    }
-    // Someone else claimed it between the SELECT and this UPDATE (another
-    // auto-assign, or a manual accept) — the wash is no longer 'requested',
-    // so every subsequent candidate's UPDATE will also match zero rows.
-    // Stop rather than looping through the rest pointlessly.
-    return null;
-  }
-
-  return null;
-}
+// Instant auto-assign (tryAutoAssign) was replaced by modules/dispatch: a
+// booking now waits for its accept window, then the dispatcher assigns it.
 
 export async function bumpJobNo(pool: any, branchId: string, branchCode: string): Promise<string> {
   const r = await pool.query(
@@ -176,7 +126,7 @@ router.post('/', requireRole('orgadmin', 'manager', 'worker'), async (req: Reque
 
     // Validate service
     const svcCheck = await client.query(
-      `SELECT id, name, earns_point FROM services
+      `SELECT id, name, earns_point, client_points_awarded, worker_points_awarded FROM services
        WHERE id = $1 AND org_id = $2 AND active
          AND (branch_id IS NULL OR branch_id = $3)`,
       [serviceId, orgId, branchId]
@@ -285,8 +235,9 @@ router.post('/', requireRole('orgadmin', 'manager', 'worker'), async (req: Reque
         client_id, client_attach_method, plate, vehicle_color,
         service_id, vehicle_class_id, price_id,
         quoted_amount_ugx, is_redemption, earns_point,
-        job_no, status, start_verified, idempotency_key, started_date
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'in_progress',$16,$17, CURRENT_DATE)
+        job_no, status, start_verified, idempotency_key, started_date,
+        client_points_to_award, worker_points_to_award
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'in_progress',$16,$17, CURRENT_DATE, $18, $19)
       RETURNING *`,
       [
         orgId, branchId, workerId, shift.id,
@@ -295,6 +246,11 @@ router.post('/', requireRole('orgadmin', 'manager', 'worker'), async (req: Reque
         serviceId, req.body.vehicle_class_id, price.id,
         price.price_ugx, isRedemption, service.earns_point,
         jobNo, startVerified, idempotencyKey || null,
+        // Frozen like the price. Awarded at settlement only if a client is
+        // attached by then (a walk-in can be attached later).
+        service.earns_point ? Number(service.client_points_awarded) : 0,
+        // The worker's points for this wash type, frozen the same way.
+        Number(service.worker_points_awarded),
       ]
     );
     const wash = washResult.rows[0];
@@ -367,6 +323,11 @@ router.get('/queue', requireRole('orgadmin', 'manager', 'worker'), async (req: R
       return;
     }
 
+    // Hand out any job whose accept window has passed before showing the
+    // list, so the screen never shows a job as open after it should have
+    // been assigned (the background tick may not have come round yet).
+    await dispatchOverdue(pool, { branchId });
+
     // Get branch ready_alert_minutes
     const branchResult = await pool.query(
       `SELECT ready_alert_minutes FROM branches WHERE id = $1`,
@@ -377,7 +338,8 @@ router.get('/queue', requireRole('orgadmin', 'manager', 'worker'), async (req: R
     // Washing: in_progress rows at this branch
     const washingResult = await pool.query(
       `SELECT w.id, w.job_no, w.plate, w.quoted_amount_ugx, w.started_at,
-              w.is_redemption, w.started_by_worker_id,
+              w.is_redemption, w.started_by_worker_id, w.worker_points_to_award,
+              w.declared_payment_method, w.points_value_ugx,
               vc.name as vehicle_class_name, s.name as service_name,
               su.full_name as worker_name,
               c.full_name as client_name,
@@ -395,7 +357,8 @@ router.get('/queue', requireRole('orgadmin', 'manager', 'worker'), async (req: R
     // Ready: ready rows at this branch
     const readyResult = await pool.query(
       `SELECT w.id, w.job_no, w.plate, w.quoted_amount_ugx, w.wash_done_at,
-              w.is_redemption, w.started_by_worker_id,
+              w.is_redemption, w.started_by_worker_id, w.worker_points_to_award,
+              w.declared_payment_method, w.points_value_ugx,
               vc.name as vehicle_class_name, s.name as service_name,
               su.full_name as worker_name,
               c.full_name as client_name,
@@ -429,7 +392,7 @@ router.get('/queue', requireRole('orgadmin', 'manager', 'worker'), async (req: R
     // against it would silently return zero rows.
     const requestedResult = await pool.query(
       `SELECT w.id, w.job_no, w.plate, w.vehicle_color, w.quoted_amount_ugx,
-              w.requested_at, w.is_redemption, w.declared_payment_method,
+              w.requested_at, w.is_redemption, w.declared_payment_method, w.worker_points_to_award,
               vc.name as vehicle_class_name, s.name as service_name,
               c.full_name as client_name,
               EXTRACT(EPOCH FROM (now() - w.requested_at)) / 60 as elapsed_minutes
@@ -441,12 +404,34 @@ router.get('/queue', requireRole('orgadmin', 'manager', 'worker'), async (req: R
        ORDER BY w.requested_at ASC`,
       [branchId]
     );
-    const requested = requestedResult.rows.map((r) => ({
-      ...r,
-      elapsed_minutes: Math.round(parseFloat(r.elapsed_minutes) || 0),
-    }));
+    // Countdown and "can I take it?" for the caller, so the app can show a
+    // timer on each job and grey out Accept rather than learn by a 409.
+    const orgId = getOrgId(req.actor!);
+    const dispatchCfg = await getDispatchConfig(pool, orgId);
+    const rule = await acceptCheck(pool, { staffId: req.actor!.sub, role: req.actor!.role ?? '', branchId, orgId });
+    const requested = requestedResult.rows.map((r) => {
+      const waited = (Date.now() - new Date(r.requested_at).getTime()) / 1000;
+      return {
+        ...r,
+        elapsed_minutes: Math.round(parseFloat(r.elapsed_minutes) || 0),
+        auto_assign_at: new Date(new Date(r.requested_at).getTime() + dispatchCfg.accept_window_seconds * 1000),
+        seconds_left: Math.max(0, Math.ceil(dispatchCfg.accept_window_seconds - waited)),
+        can_accept: rule.allowed,
+      };
+    });
 
-    res.json({ ok: true, data: { washing, ready, requested } });
+    res.json({
+      ok: true,
+      data: {
+        washing, ready, requested,
+        dispatch: {
+          accept_window_seconds: dispatchCfg.accept_window_seconds,
+          my_jobs: rule.myJobs,
+          fewest_jobs_on_site: rule.fewestJobs,
+          can_accept: rule.allowed,
+        },
+      },
+    });
   } catch (err) {
     next(err);
   }
@@ -482,17 +467,33 @@ router.post('/:id/accept', requireRole('orgadmin', 'manager', 'worker'), async (
       return;
     }
 
-    // "Free" means zero washes this worker already has in progress — a
-    // query-time definition, not a schema constraint (nothing stops a
-    // worker starting several the old walk-in way). Checked here, not as a
+    // The fewest-jobs rule (modules/dispatch): nobody on site may have
+    // fewer cars than the worker taking this one. Checked here, not as a
     // queue-visibility filter, so a busy worker still sees what's coming.
-    const busy = await client.query(
-      `SELECT COUNT(*) as cnt FROM washes WHERE started_by_worker_id = $1 AND status = 'in_progress'`,
-      [workerId]
-    );
-    if (parseInt(busy.rows[0].cnt) > 0) {
+    const rule = await acceptCheck(client, {
+      staffId: workerId, role: req.actor!.role ?? '', branchId, orgId: getOrgId(req.actor!),
+    });
+    if (!rule.allowed) {
       await client.query('ROLLBACK');
-      next(createAppError(409, 'WORKER_BUSY', 'Finish your current car before accepting another'));
+      next(createAppError(409, 'WORKER_BUSY',
+        'Another worker has fewer cars right now — they get this one first',
+        { your_jobs: rule.myJobs, fewest_jobs: rule.fewestJobs }));
+      return;
+    }
+
+    // Experience gate for high-level cars — a no-op until that rule is
+    // decided (see requiredPointsFor).
+    const target = await client.query(
+      `SELECT w.quoted_amount_ugx, w.vehicle_class_id, w.service_id, w.plate,
+              COALESCE(a.lifetime_earned, 0) AS my_points
+         FROM washes w LEFT JOIN worker_points_accounts a ON a.staff_id = $2
+        WHERE w.id = $1`,
+      [req.params.id, workerId]
+    );
+    if (target.rows[0] && req.actor!.role === 'worker'
+        && Number(target.rows[0].my_points) < requiredPointsFor(target.rows[0])) {
+      await client.query('ROLLBACK');
+      next(createAppError(403, 'NOT_ENOUGH_POINTS', 'This car needs a more experienced worker'));
       return;
     }
 
@@ -501,7 +502,7 @@ router.post('/:id/accept', requireRole('orgadmin', 'manager', 'worker'), async (
     const claimed = await client.query(
       `UPDATE washes
           SET status = 'in_progress', started_by_worker_id = $1, started_shift_id = $2,
-              started_at = now(), updated_at = now()
+              started_at = now(), assigned_via = 'accept', updated_at = now()
         WHERE id = $3 AND branch_id = $4
           AND status = 'requested' AND started_by_worker_id IS NULL
         RETURNING id, job_no, client_id`,
@@ -826,23 +827,27 @@ async function settleWash(
     }
 
     // 6. Settle
-    const amountUgx = wash.is_redemption ? 0 : Number(wash.quoted_amount_ugx);
+    //
+    // What the client hands over is the price less whatever their points
+    // already covered at booking. A wash covered entirely by points is its
+    // own payment method — no money moved, but it wasn't free either.
+    const pointsCoverUgx = Number(wash.points_value_ugx || 0);
+    const amountUgx = wash.is_redemption ? 0 : Math.max(0, Number(wash.quoted_amount_ugx) - pointsCoverUgx);
+    const fullyCoveredByPoints = !wash.is_redemption && Number(wash.points_used) > 0 && amountUgx === 0;
     const settleVerified = opts.payTokenConsumed;
-    const paymentMethod = wash.is_redemption ? 'free' : (opts.paymentMethod || 'cash');
+    const paymentMethod = wash.is_redemption ? 'free'
+      : fullyCoveredByPoints ? 'points'
+      : (opts.paymentMethod || 'cash');
 
     // Worker commission, frozen onto the row at settlement.
     //
-    // Cash only: the worker keeps their cut out of the notes in their hand,
-    // so there is nothing to keep out of a mobile-money payment that went
-    // straight to the business, or a free wash where no money moved.
-    // Rounded down to the shilling — rounding up would have the worker
-    // keeping a shilling the till never received, which is exactly the kind
-    // of one-unit drift that makes a handover look short.
+    // On the FULL price, for every payment method — cash, mobile money,
+    // points, even a free wash: the worker did the same work either way,
+    // and the business absorbs the discount. It goes into the wallet of the
+    // worker who washed the car (see recordSettlement below), not kept out
+    // of the cash, so a mobile-money wash pays the worker too.
     const commissionBp = Number(shift.worker_commission_bp || 0);
-    const commissionUgx =
-      paymentMethod === 'cash' && commissionBp > 0
-        ? Math.floor((amountUgx * commissionBp) / 10000)
-        : 0;
+    const commissionUgx = commissionFor(Number(wash.quoted_amount_ugx), commissionBp);
 
     await client.query(
       `UPDATE washes SET
@@ -859,6 +864,7 @@ async function settleWash(
         payer_phone = $9,
         payment_ref = $10,
         worker_commission_ugx = $12,
+        worker_commission_bp = $13,
         updated_at = now()
        WHERE id = $11`,
       [
@@ -876,6 +882,7 @@ async function settleWash(
         opts.paymentRef || null,
         washId,
         commissionUgx,
+        commissionBp,
       ]
     );
 
@@ -899,23 +906,43 @@ async function settleWash(
       promoRedeemed = await hasArmedPromo(client, wash.client_id, wash.promo_key);
     }
 
+    //
+    // Points replaced the stamp card, so a paid wash no longer stamps
+    // anything. processSettlement is still called for a free-wash credit
+    // redemption, so credits clients earned under the old card stay
+    // spendable — `earnsPoint` is passed false so it never stamps.
     let loyaltyResult: any = null;
     if (wash.client_id) {
       await ensureAccount(client, wash.client_id, opts.orgId);
       if (promoRedeemed) {
         loyaltyResult = await redeemPromo(client, wash.client_id, washId, opts.workerId);
-      } else {
+      } else if (wash.is_redemption) {
         loyaltyResult = await processSettlement(
           client,
           wash.client_id,
           opts.orgId,
           washId,
-          wash.is_redemption,
-          wash.earns_point,
+          true,
+          false,
           amountUgx,
           opts.workerId
         );
       }
+    }
+
+    // 8a. Client points — the number frozen onto the wash at booking. A
+    // free wash (credit or promo) and a wash paid entirely with points earn
+    // nothing.
+    let clientPointsResult: { points: number; account: any } | null = null;
+    if (wash.client_id && !wash.is_redemption) {
+      clientPointsResult = await awardClientPoints(client, {
+        clientId: wash.client_id,
+        orgId: wash.org_id,
+        washId,
+        points: Number(wash.client_points_to_award || 0),
+        fullyCoveredByPoints,
+        createdBy: opts.workerId,
+      });
     }
 
     // 8b. Worker points — the staff side of the same moment. Inside this
@@ -923,12 +950,29 @@ async function settleWash(
     // to roll back with it, or a worker keeps points for a wash that never
     // happened. A walk-in with no client_id still earns the worker points;
     // the work was done either way.
+    //
+    // Points are experience: they go to the worker who WASHED the car, and
+    // are earned on every wash — paid with points, a free promo wash, a
+    // credit — valued at the full price, because the work was the same.
+    // They drive auto-assign priority and the leaderboard.
     const workerPointsResult = await awardWorkerPoints(client, {
-      staffId: opts.workerId,
-      orgId: opts.orgId,
+      staffId: wash.started_by_worker_id,
+      orgId: wash.org_id,
       washId,
-      amountUgx,
-      isRedemption: wash.is_redemption,
+      // Frozen at booking from the wash type's Settings value.
+      points: Number(wash.worker_points_to_award ?? 0),
+    });
+
+    // 8c. Wallet — commission to the worker who washed, the cash against
+    // the worker who took it. Same transaction, so a rolled-back settle
+    // moves no money.
+    const walletResult = await recordWalletSettlement(client, {
+      washId,
+      orgId: wash.org_id,
+      starterId: wash.started_by_worker_id,
+      settlerId: opts.workerId,
+      commissionUgx,
+      cashUgx: paymentMethod === 'cash' ? amountUgx : 0,
     });
 
     // Burn the customer's pay token as part of this transaction — see the
@@ -954,8 +998,8 @@ async function settleWash(
     if (wash.client_id) {
       notify('client', wash.client_id, 'paid', {
         wash_id: washId, receipt_no: receiptNo, amount_ugx: amountUgx,
-        wash_count: loyaltyResult?.account?.wash_count ?? '?',
-        washes_required: 7,
+        points_earned: clientPointsResult?.points ?? 0,
+        points_balance: clientPointsResult?.account?.balance,
       });
       if (loyaltyResult?.rewardGranted) {
         notify('client', wash.client_id, 'reward_earned', {
@@ -999,15 +1043,28 @@ async function settleWash(
         amount_ugx: amountUgx,
         settle_verified: settleVerified,
         is_handover: isHandover,
+        payment_method: paymentMethod,
+        points_value_ugx: pointsCoverUgx,
         loyalty: loyaltyResult ? {
           wash_count: loyaltyResult.account.wash_count,
           free_wash_credits: loyaltyResult.account.free_wash_credits,
           reward_granted: loyaltyResult.rewardGranted,
         } : null,
+        client_points: clientPointsResult ? {
+          earned: clientPointsResult.points,
+          balance: clientPointsResult.account.balance,
+        } : null,
+        worker_commission_ugx: commissionUgx,
+        // The settling worker's wallet after this wash — negative while they
+        // hold cash that is owed to the business.
+        wallet_balance_ugx: (walletResult.settler ?? (wash.started_by_worker_id === opts.workerId ? walletResult.starter : null))
+          ?.balance_ugx ?? null,
         // What this job earned the worker, so the app can show it on the
         // receipt the way the customer's stamp is shown. Null when the
-        // scheme is off or the wash was free.
+        // scheme is off. Credited to the washer, who on a handover is not
+        // the caller.
         worker_points: workerPointsResult ? {
+          staff_id: wash.started_by_worker_id,
           earned: workerPointsResult.points,
           balance: workerPointsResult.account.points_balance,
         } : null,
@@ -1034,12 +1091,22 @@ const cancelSchema = z.object({
 });
 
 router.post('/:id/cancel', requireRole('orgadmin', 'manager', 'worker'), async (req: Request, res: Response, next: NextFunction) => {
+  const pool = getPool();
+  const client = await pool.connect();
   try {
-    const pool = getPool();
     const { id } = req.params;
     const body = cancelSchema.parse(req.body);
+    await client.query('BEGIN');
 
-    const result = await pool.query(
+    // 'requested' is cancellable too: bookings now wait for their accept
+    // window, and a client who drives off before anyone takes the car has
+    // to be cancellable by staff, not only by the client.
+    //
+    // Scoped to the caller's organisation always, and to their own branch
+    // unless they are an org admin. This used to match on id alone, so
+    // staff anywhere could cancel any organisation's wash by its id.
+    const isOrgAdmin = req.actor!.role === 'orgadmin';
+    const result = await client.query(
       `UPDATE washes SET
         status = 'cancelled',
         cancelled_at = now(),
@@ -1047,15 +1114,27 @@ router.post('/:id/cancel', requireRole('orgadmin', 'manager', 'worker'), async (
         cancel_reason = $2,
         cancel_note = $3,
         updated_at = now()
-       WHERE id = $4 AND status IN ('in_progress', 'ready')
+       WHERE id = $4 AND status IN ('requested', 'in_progress', 'ready')
+         AND org_id = $5 AND ($6::boolean OR branch_id = $7)
        RETURNING id, job_no, status`,
-      [req.actor!.sub, body.reason, body.note || null, id]
+      [req.actor!.sub, body.reason, body.note || null, id,
+       getOrgId(req.actor!), isOrgAdmin, req.actor!.branch_id ?? null]
     );
 
     if (result.rows.length === 0) {
-      const check = await pool.query(`SELECT status FROM washes WHERE id = $1`, [id]);
+      await client.query('ROLLBACK');
+      // Another organisation's wash reads as not found — its existence is
+      // not this caller's business.
+      const check = await pool.query(
+        `SELECT status, branch_id FROM washes WHERE id = $1 AND org_id = $2`,
+        [id, getOrgId(req.actor!)]
+      );
       if (check.rows.length === 0) {
         next(createAppError(404, 'NOT_FOUND', 'Wash not found'));
+        return;
+      }
+      if (!isOrgAdmin && check.rows[0].branch_id !== req.actor!.branch_id) {
+        next(createAppError(409, 'WRONG_BRANCH', 'Wash is at a different branch'));
         return;
       }
       next(createAppError(409, 'BAD_STATE', `Cannot cancel wash in ${check.rows[0].status} status`));
@@ -1069,15 +1148,25 @@ router.post('/:id/cancel', requireRole('orgadmin', 'manager', 'worker'), async (
     // cancel-request route has the equivalent cleanup for not-yet-accepted
     // bookings.) Once used, immutable: the reward was consumed by a settled
     // wash, and no later cancellation rewrites history.
-    await pool.query(
+    await client.query(
       `DELETE FROM promo_redemptions
         WHERE started_wash_id = $1 AND status = 'armed' AND free_wash_id IS NULL`,
       [id]
     );
 
-    res.json({ ok: true, data: result.rows[0] });
+    // The client paid points for a wash they are not getting — give them
+    // back, in the same transaction as the cancel.
+    const pointsRefunded = await refundClientPoints(client, {
+      washId: String(id), reason: `Wash cancelled: ${body.reason}`, createdBy: req.actor!.sub,
+    });
+
+    await client.query('COMMIT');
+    res.json({ ok: true, data: { ...result.rows[0], points_refunded: pointsRefunded } });
   } catch (err) {
+    await client.query('ROLLBACK');
     next(err);
+  } finally {
+    client.release();
   }
 });
 
@@ -1321,8 +1410,14 @@ router.get('/:id', requireRole('orgadmin', 'manager', 'worker'), async (req: Req
        LEFT JOIN staff_users stw ON w.settled_by_worker_id = stw.id
        LEFT JOIN staff_users cb ON w.cancelled_by = cb.id
        LEFT JOIN clients c ON w.client_id = c.id
-       WHERE w.id = $1`,
-      [id]
+       WHERE w.id = $1
+         AND w.org_id = $2
+         AND ($3::boolean OR w.branch_id = $4)`,
+      // Scoped like every other org read: the caller's organisation always,
+      // and a manager or worker only their own branch. This used to match
+      // on id alone, so any signed-in staff member — including another
+      // company's — could read a wash's client, amounts and staff by id.
+      [id, getOrgId(req.actor!), req.actor!.role === 'orgadmin', req.actor!.branch_id ?? null]
     );
 
     if (result.rows.length === 0) {
@@ -1423,10 +1518,10 @@ router.get('/', requireRole('orgadmin', 'manager', 'worker'), async (req: Reques
  * last week must see what they actually earned then, not what this week's
  * rate would have paid.
  *
- * Attributed to `settled_by_worker_id` — whoever took the money earned the
- * cut, which is also who was holding the cash it came out of. On a
- * handover that is deliberately the settling worker, not the one who
- * started the car.
+ * Attributed to `started_by_worker_id` — the worker who washed the car
+ * earned the cut, whoever took the money. Commission is paid into the
+ * wallet (modules/wallet), so on a handover the settler holds the cash and
+ * the washer still gets paid.
  */
 router.get('/mine/earnings', requireRole('orgadmin', 'manager', 'worker'), async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -1450,7 +1545,7 @@ router.get('/mine/earnings', requireRole('orgadmin', 'manager', 'worker'), async
          COUNT(*) FILTER (
            WHERE settled_at >= date_trunc('month', CURRENT_DATE)) AS month_washes
        FROM washes
-       WHERE settled_by_worker_id = $1 AND status = 'settled'`,
+       WHERE started_by_worker_id = $1 AND status = 'settled'`,
       [workerId]
     );
 
@@ -1460,7 +1555,7 @@ router.get('/mine/earnings', requireRole('orgadmin', 'manager', 'worker'), async
               COALESCE(SUM(worker_commission_ugx), 0) AS earned_ugx,
               COUNT(*) AS washes
          FROM washes
-        WHERE settled_by_worker_id = $1 AND status = 'settled'
+        WHERE started_by_worker_id = $1 AND status = 'settled'
           AND settled_at >= CURRENT_DATE - INTERVAL '13 days'
         GROUP BY settled_at::date
         ORDER BY day`,
@@ -1476,7 +1571,7 @@ router.get('/mine/earnings', requireRole('orgadmin', 'manager', 'worker'), async
          FROM washes w
          LEFT JOIN vehicle_classes vc ON vc.id = w.vehicle_class_id
          LEFT JOIN services s ON s.id = w.service_id
-        WHERE w.settled_by_worker_id = $1 AND w.status = 'settled'
+        WHERE w.started_by_worker_id = $1 AND w.status = 'settled'
         ORDER BY w.settled_at DESC
         LIMIT 20`,
       [workerId]

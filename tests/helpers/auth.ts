@@ -37,6 +37,9 @@ export const ACCOUNT_PHONES: Record<string, string> = {
   // are NOT a cross-branch pair. Anything testing branch isolation needs a
   // worker created on another branch rather than reaching for musa.
   musa: '+256700200004',
+  // Org admin of Shine Motors, the second seeded organisation — for proving
+  // that one tenant's settings and balances never touch another's.
+  shineadmin: '+256700200005',
 };
 
 const tokenCache = new Map<string, string>();
