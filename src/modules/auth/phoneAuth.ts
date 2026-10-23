@@ -251,6 +251,12 @@ router.post('/verify', async (req: Request, res: Response, next: NextFunction) =
         'INSERT INTO refresh_tokens (owner_type, owner_id, token_hash, expires_at) VALUES ($1,$2,$3,$4)',
         ['platform', platformRow.id, tokenHash, expiresAt]
       );
+      // See the staff branch below: a phone-code sign-in proves identity,
+      // and there is no password to change, so the old flag is cleared.
+      await conn.query(
+        'UPDATE platform_admins SET must_change_password = false, last_login_at = now() WHERE id = $1',
+        [platformRow.id]
+      );
 
       await conn.query('COMMIT');
       res.json({
@@ -292,6 +298,16 @@ router.post('/verify', async (req: Request, res: Response, next: NextFunction) =
       await conn.query(
         'INSERT INTO refresh_tokens (owner_type, owner_id, token_hash, expires_at) VALUES ($1,$2,$3,$4)',
         ['staff', staffRow.id, tokenHash, expiresAt]
+      );
+      // Sign-in is phone + one-time code only; nothing in the app can change
+      // a password. Accounts seeded or created under the old password flow
+      // still carried must_change_password = true, and the auth gate then
+      // answered 403 PASSWORD_CHANGE_REQUIRED to almost every staff request
+      // with no way out. Proving the phone is the identity check now, so a
+      // successful code sign-in clears the flag.
+      await conn.query(
+        'UPDATE staff_users SET must_change_password = false, last_login_at = now() WHERE id = $1',
+        [staffRow.id]
       );
 
       await conn.query('COMMIT');
