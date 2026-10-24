@@ -92,6 +92,16 @@ export async function notify(
       })));
       break;
 
+    case 'payment_received':
+      messages.push(...tokens.map((to) => ({
+        to,
+        title: 'Payment received',
+        body: `We received UGX ${Number(payload.amount_ugx || 0).toLocaleString()}. Thank you.`,
+        data: { event, wash_id: payload.wash_id },
+        sound: 'default',
+      })));
+      break;
+
     case 'paid':
       messages.push(...tokens.map((to) => ({
         to,

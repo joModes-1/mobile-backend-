@@ -45,6 +45,7 @@ import issueRouter from '@/modules/support/issueRoutes';
 import exceptionRouter from '@/modules/washes/exceptionRoutes';
 import settingsRouter from '@/modules/settings/settingsRoutes';
 import walletRouter from '@/modules/wallet/walletRoutes';
+import { clientPaymentRouter, publicPaymentRouter } from '@/modules/payments';
 
 export const logger = pino({
   name: 'carwash-api',
@@ -76,6 +77,10 @@ app.use('/api/v1/auth/platform', platformAuthRouter);
 app.use('/api/v1/auth/staff', staffAuthRouter);
 app.use('/api/v1/auth/client', clientAuthRouter);
 app.use('/api/v1/auth/phone', phoneAuthRouter);
+// PesaPal and the customer's browser call these, so no sign-in. They must sit
+// above the authenticated /api/v1 routers below; the IPN verifies everything
+// against PesaPal itself.
+app.use('/api/v1/payments', publicPaymentRouter);
 
 // Global auth + password-changed check for all protected routes
 app.use('/api/v1/me', authenticate, requirePasswordChanged, meRouter);
@@ -93,6 +98,7 @@ app.use('/api/v1/me/device', authenticate, requirePasswordChanged, deviceRouter)
 
 // Phase 4: Wash lifecycle
 // Client token endpoints (mounted under /me/washes/tokens)
+app.use('/api/v1/me/payments', authenticate, requirePasswordChanged, clientPaymentRouter);
 app.use('/api/v1/me/washes', authenticate, requirePasswordChanged, tokenRouter);
 // Client wash read endpoints (active, history, loyalty, qr)
 app.use('/api/v1/me/washes', authenticate, requirePasswordChanged, clientWashRouter);

@@ -39,7 +39,7 @@ async function activeWashes(clientId: string, limit?: number) {
 
   const result = await pool.query(
     `SELECT w.id, w.job_no, w.receipt_no, w.status, w.quoted_amount_ugx, w.started_at,
-            w.requested_at, w.is_redemption, w.declared_payment_method, w.promo_key, w.plate,
+            w.requested_at, w.is_redemption, w.declared_payment_method, w.paid_online_at, w.promo_key, w.plate,
             w.points_used, w.points_value_ugx, w.client_points_to_award,
             CASE WHEN w.status = 'requested'
                  THEN w.requested_at + make_interval(secs => dc.accept_window_seconds) END AS auto_assign_at,

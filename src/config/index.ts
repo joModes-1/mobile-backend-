@@ -34,6 +34,15 @@ const envSchema = z.object({
   TEST_MODE: z.enum(['true', 'false', '1', '0', '']).default('false')
     .transform((v) => v === 'true' || v === '1'),
 
+  // PesaPal 3.0, for collecting mobile money and card payments from clients.
+  // Credentials live only in the environment, never in the repo. PESAPAL_ENV
+  // picks the endpoint: sandbox moves no real money. PUBLIC_API_URL is this
+  // API's public https address — PesaPal calls the IPN and return URLs on it.
+  PESAPAL_CONSUMER_KEY: z.string().optional(),
+  PESAPAL_CONSUMER_SECRET: z.string().optional(),
+  PESAPAL_ENV: z.enum(['sandbox', 'live']).default('sandbox'),
+  PUBLIC_API_URL: z.string().optional(),
+
   // Name lookup by phone (modules/nameLookup): a new client's registered
   // name from MTN MoMo or Airtel Money. All optional — a network with no
   // credentials is simply skipped, and with neither configured new clients

@@ -339,7 +339,7 @@ router.get('/queue', requireRole('orgadmin', 'manager', 'worker'), async (req: R
     const washingResult = await pool.query(
       `SELECT w.id, w.job_no, w.plate, w.quoted_amount_ugx, w.started_at,
               w.is_redemption, w.promo_key, w.started_by_worker_id, w.worker_points_to_award,
-              w.declared_payment_method, w.points_value_ugx,
+              w.declared_payment_method, w.paid_online_at, w.online_payment_ref, w.points_value_ugx,
               vc.name as vehicle_class_name, s.name as service_name,
               su.full_name as worker_name,
               c.full_name as client_name,
@@ -358,7 +358,7 @@ router.get('/queue', requireRole('orgadmin', 'manager', 'worker'), async (req: R
     const readyResult = await pool.query(
       `SELECT w.id, w.job_no, w.plate, w.quoted_amount_ugx, w.wash_done_at,
               w.is_redemption, w.promo_key, w.started_by_worker_id, w.worker_points_to_award,
-              w.declared_payment_method, w.points_value_ugx,
+              w.declared_payment_method, w.paid_online_at, w.online_payment_ref, w.points_value_ugx,
               vc.name as vehicle_class_name, s.name as service_name,
               su.full_name as worker_name,
               c.full_name as client_name,
@@ -392,7 +392,7 @@ router.get('/queue', requireRole('orgadmin', 'manager', 'worker'), async (req: R
     // against it would silently return zero rows.
     const requestedResult = await pool.query(
       `SELECT w.id, w.job_no, w.plate, w.vehicle_color, w.quoted_amount_ugx,
-              w.requested_at, w.is_redemption, w.promo_key, w.declared_payment_method, w.worker_points_to_award,
+              w.requested_at, w.is_redemption, w.promo_key, w.declared_payment_method, w.paid_online_at, w.online_payment_ref, w.worker_points_to_award,
               vc.name as vehicle_class_name, s.name as service_name,
               c.full_name as client_name,
               EXTRACT(EPOCH FROM (now() - w.requested_at)) / 60 as elapsed_minutes
@@ -837,7 +837,9 @@ async function settleWash(
     const settleVerified = opts.payTokenConsumed;
     const paymentMethod = wash.is_redemption ? 'free'
       : fullyCoveredByPoints ? 'points'
-      : (opts.paymentMethod || 'cash');
+      // A wash paid online through PesaPal settles as that mobile-money
+      // payment, whatever the caller sent: the money is already in.
+      : (wash.paid_online_at ? wash.online_payment_method : (opts.paymentMethod || 'cash'));
 
     // Worker commission, frozen onto the row at settlement.
     //
@@ -879,7 +881,7 @@ async function settleWash(
         // be counted as cash the worker is holding.
         paymentMethod,
         opts.payerPhone || null,
-        opts.paymentRef || null,
+        wash.paid_online_at ? wash.online_payment_ref : (opts.paymentRef || null),
         washId,
         commissionUgx,
         commissionBp,
