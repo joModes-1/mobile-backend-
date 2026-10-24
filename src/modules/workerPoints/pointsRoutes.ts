@@ -44,9 +44,10 @@ router.get('/me', async (req: Request, res: Response, next: NextFunction) => {
 
     const history = await pool.query(
       `SELECT l.id, l.entry_type, l.points_delta, l.balance_after, l.reason,
-              l.created_at, w.job_no, w.receipt_no, w.amount_ugx
+              l.created_at, w.job_no, w.receipt_no, w.amount_ugx, s.name AS service_name
          FROM worker_points_ledger l
          LEFT JOIN washes w ON w.id = l.wash_id
+         LEFT JOIN services s ON s.id = w.service_id
         WHERE l.staff_id = $1
         ORDER BY l.created_at DESC
         LIMIT 50`,

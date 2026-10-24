@@ -4,7 +4,7 @@ import { getPool } from '@/db';
 import { createAppError } from '@/middleware/errorHandler';
 import { requireRole, getOrgId } from '@/middleware/requireRole';
 import { consumeToken, hashToken } from '@/modules/tokens/tokenRoutes';
-import { processSettlement, ensureAccount, hasArmedPromo, redeemPromo } from '@/modules/loyalty';
+import { processSettlement, ensureAccount, hasArmedPromo, redeemPromo, releasePromoPair } from '@/modules/loyalty';
 import { awardForSettlement as awardWorkerPoints } from '@/modules/workerPoints';
 import { awardForSettlement as awardClientPoints, refundForWash as refundClientPoints } from '@/modules/clientPoints';
 import { commissionFor, recordSettlement as recordWalletSettlement } from '@/modules/wallet';
@@ -338,7 +338,7 @@ router.get('/queue', requireRole('orgadmin', 'manager', 'worker'), async (req: R
     // Washing: in_progress rows at this branch
     const washingResult = await pool.query(
       `SELECT w.id, w.job_no, w.plate, w.quoted_amount_ugx, w.started_at,
-              w.is_redemption, w.started_by_worker_id, w.worker_points_to_award,
+              w.is_redemption, w.promo_key, w.started_by_worker_id, w.worker_points_to_award,
               w.declared_payment_method, w.points_value_ugx,
               vc.name as vehicle_class_name, s.name as service_name,
               su.full_name as worker_name,
@@ -357,7 +357,7 @@ router.get('/queue', requireRole('orgadmin', 'manager', 'worker'), async (req: R
     // Ready: ready rows at this branch
     const readyResult = await pool.query(
       `SELECT w.id, w.job_no, w.plate, w.quoted_amount_ugx, w.wash_done_at,
-              w.is_redemption, w.started_by_worker_id, w.worker_points_to_award,
+              w.is_redemption, w.promo_key, w.started_by_worker_id, w.worker_points_to_award,
               w.declared_payment_method, w.points_value_ugx,
               vc.name as vehicle_class_name, s.name as service_name,
               su.full_name as worker_name,
@@ -392,7 +392,7 @@ router.get('/queue', requireRole('orgadmin', 'manager', 'worker'), async (req: R
     // against it would silently return zero rows.
     const requestedResult = await pool.query(
       `SELECT w.id, w.job_no, w.plate, w.vehicle_color, w.quoted_amount_ugx,
-              w.requested_at, w.is_redemption, w.declared_payment_method, w.worker_points_to_award,
+              w.requested_at, w.is_redemption, w.promo_key, w.declared_payment_method, w.worker_points_to_award,
               vc.name as vehicle_class_name, s.name as service_name,
               c.full_name as client_name,
               EXTRACT(EPOCH FROM (now() - w.requested_at)) / 60 as elapsed_minutes
@@ -1018,21 +1018,6 @@ async function settleWash(
     if (promoRedeemed) {
       notify('client', wash.client_id, 'promo_used', { wash_id: washId, job_no: wash.job_no });
     }
-    if (
-      !promoRedeemed &&
-      wash.client_id &&
-      wash.promo_key &&
-      wash.status === 'settled' &&
-      !wash.is_redemption
-    ) {
-      // The paid wash of a promo just settled — the reward is earned.
-      // Narrow on promo_key + not-redemption: a settled wash WITH the key
-      // that was NOT free is the paid one, by construction. Guarded by the
-      // same UPDATE predicate that flips the row, so re-settling (already
-      // impossible — status gate above) or a plain booking with a stray key
-      // cannot double-fire.
-      notify('client', wash.client_id, 'promo_earned', { wash_id: washId, job_no: wash.job_no });
-    }
 
     res.json({
       ok: true,
@@ -1141,18 +1126,10 @@ router.post('/:id/cancel', requireRole('orgadmin', 'manager', 'worker'), async (
       return;
     }
 
-    // Promo unwinding: if a promo redemption still points its PAID wash at
-    // this cancelled wash and the reward was never spent, the offer never
-    // legitimately armed — the paid wash never settled — so the row goes
-    // away and the client can grab the offer again. (The client's own
-    // cancel-request route has the equivalent cleanup for not-yet-accepted
-    // bookings.) Once used, immutable: the reward was consumed by a settled
-    // wash, and no later cancellation rewrites history.
-    await client.query(
-      `DELETE FROM promo_redemptions
-        WHERE started_wash_id = $1 AND status = 'armed' AND free_wash_id IS NULL`,
-      [id]
-    );
+    // If this car was one of a 2-for-1 pair, the other carries on at its
+    // own price and the client gets the offer back (loyalty.releasePromoPair).
+    // The client's own cancel-request route does the same.
+    await releasePromoPair(client, String(id));
 
     // The client paid points for a wash they are not getting — give them
     // back, in the same transaction as the cancel.

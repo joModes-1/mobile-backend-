@@ -204,16 +204,69 @@ export async function correctForWash(
 }
 
 /**
+ * The cash each worker still holds for the business — one of the two pots
+ * their single balance is made of (decided 2026-10-23):
+ *
+ *   cash     per cash wash they settled, the cash they took less the
+ *            commission they kept out of it (never below nothing), less
+ *            everything a manager has confirmed receiving;
+ *   account  everything else — commission on mobile-money, points and free
+ *            washes, a washer's commission on a car someone else settled,
+ *            withdrawals, adjustments. Theirs to withdraw, whatever cash
+ *            they are holding.
+ *
+ * balance = account − cash owed, always, so the account is never stored:
+ * it is the balance plus what this returns. Worked out from the ledger per
+ * wash, so a reversal or correction lands in the pot its wash belongs to.
+ */
+export async function cashOwedFor(client: PoolClient | any, staffIds: string[]): Promise<Map<string, number>> {
+  const out = new Map<string, number>(staffIds.map((id) => [id, 0]));
+  if (staffIds.length === 0) return out;
+  const r = await client.query(
+    `WITH cash_washes AS (
+       SELECT DISTINCT staff_id, wash_id FROM wallet_ledger
+        WHERE kind = 'cash_collected' AND staff_id = ANY($1::uuid[])
+     ),
+     per_wash AS (
+       SELECT l.staff_id, SUM(l.amount_ugx) AS net
+         FROM wallet_ledger l
+         JOIN cash_washes c ON c.staff_id = l.staff_id AND c.wash_id = l.wash_id
+        GROUP BY l.staff_id, l.wash_id
+     ),
+     held AS (SELECT staff_id, SUM(LEAST(net, 0)) AS amount FROM per_wash GROUP BY staff_id),
+     handed AS (
+       SELECT staff_id, SUM(amount_ugx) AS amount FROM wallet_ledger
+        WHERE kind = 'cash_handover' AND staff_id = ANY($1::uuid[])
+        GROUP BY staff_id
+     )
+     SELECT s.staff_id, COALESCE(h.amount, 0) + COALESCE(d.amount, 0) AS pot
+       FROM unnest($1::uuid[]) AS s(staff_id)
+       LEFT JOIN held h ON h.staff_id = s.staff_id
+       LEFT JOIN handed d ON d.staff_id = s.staff_id`,
+    [staffIds]
+  );
+  for (const row of r.rows) out.set(row.staff_id, Math.max(0, -Number(row.pot)));
+  return out;
+}
+
+export async function cashOwed(client: PoolClient | any, staffId: string): Promise<number> {
+  return (await cashOwedFor(client, [staffId])).get(staffId) ?? 0;
+}
+
+/**
  * A manager confirms receiving cash from a worker. Partial amounts are
- * fine; more than the worker owes is refused — over-confirming would hand
- * the worker a positive, withdrawable balance for money that never existed.
+ * fine; more than the cash the worker holds is refused — over-confirming
+ * would hand the worker a withdrawable balance for money that never existed.
+ * The limit is the cash pot, not the net balance: commission sitting in the
+ * worker's account does not shrink the cash they have to bring in.
  */
 export async function cashHandover(
   client: PoolClient,
   opts: { staffId: string; orgId: string; amountUgx: number; by: string; note?: string | null }
 ): Promise<WalletAccount> {
-  const account = await lockAccount(client, opts.staffId, opts.orgId);
-  const owed = Math.max(0, -account.balance_ugx);
+  // Lock first: every ledger write for this worker goes through the same row.
+  await lockAccount(client, opts.staffId, opts.orgId);
+  const owed = await cashOwed(client, opts.staffId);
   if (owed === 0) throw new WalletError('NOTHING_OWED', 'This worker does not owe any cash', 409);
   if (opts.amountUgx > owed) {
     throw new WalletError('MORE_THAN_OWED', `This worker only owes UGX ${owed}`, 422, { owed_ugx: owed });

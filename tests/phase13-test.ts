@@ -1,22 +1,25 @@
 /**
  * Phase 13 — "wash 2 cars for the price of 1" promo.
  *
- * The model: a client GRABS the home screen offer and books wash #1 at full
- * price with use_promo=true (a promo_redemptions row is created, armed).
- * When that wash SETTLES, the reward is earned — the client's next booking
- * with use_promo_free=true is free (is_redemption, amount 0, payment_method
- * 'free') WITHOUT consuming any loyalty free_wash_credit, and settles the
- * redemption row to 'used'.
+ * The model (owner's call, Oct 2026): one booking, two cars, at one branch
+ * (POST /me/washes/promo). The dearer car is charged at its own price and
+ * the other is free; on a tie the first car is charged. Each car is its own
+ * wash with its own job number. The offer is taken the moment the pair is
+ * booked — one per client — and the free car settles at 0 WITHOUT
+ * consuming any loyalty free_wash_credit or stamping an extra wash. Points
+ * don't combine with the offer.
  *
- * Covers: the /me/washes/promo state endpoint across the whole lifecycle,
- * arming at booking, the one-time-per-client guarantee (a second grab is a
- * 409, not a 500), the free wash at settlement, credit immunity (a credit
- * the client earned must survive the promo's free wash), client-cancel
- * unwinding, and the stale-client guards.
+ * A client is no longer limited to one car on the go, so a normal booking
+ * alongside the pair must go through.
+ *
+ * Cancelling either car of a pair before the free car is washed hands the
+ * offer back, and the other car carries on as an ordinary booking at its
+ * own price — so a paid car cancelled turns its free partner into a paid
+ * one.
  *
  * Same style as phase12: assertions are recorded rather than thrown, every
  * act is wrapped so one failure does not hide the rest, and re-running the
- * suite should pass twice in a row.
+ * suite should pass twice in a row (each run uses fresh client numbers).
  */
 
 import { signInAs, signInByPhone } from './helpers/auth';
@@ -60,14 +63,21 @@ async function ensureFree(workerToken: string, orgadminToken: string) {
   }
 }
 
+/** A client number nobody has used — the offer is one-time per client. */
+let phoneSeq = 0;
+const freshPhone = () => '+2567' + String(Date.now() + 10 + phoneSeq++).slice(-8);
+
 async function main() {
   console.log('PHASE 13 — two-for-one promo, against ' + BASE);
 
   let orgadmin = '', joseph = '', musa = '', client = '';
   let josephId = '', musaId = '';
-  let orgId = '', branchId = '', branchCode = '';
-  let vcId = '', svcId = '', priceUgx = 0;
-  let washId = '';
+  let branchId = '';
+  // Two priced cars at different prices, so "the dearer one is charged" is
+  // actually tested rather than satisfied by a tie.
+  let cheap: { vehicle_class_id: string; service_id: string; price: number } | null = null;
+  let dear: { vehicle_class_id: string; service_id: string; price: number } | null = null;
+  let pair: any = null;
 
   /** Token of whichever worker actually started a wash (handover rule). */
   const workerTokenFor = async (id: string) => {
@@ -78,191 +88,213 @@ async function main() {
     return musa;
   };
 
+  /** Accept with whichever worker the fewest-jobs rule allows. */
+  const acceptAny = async (id: string) => {
+    const a = await call('POST', `/washes/${id}/accept`, undefined, musa);
+    if (a.status === 200) return a;
+    return call('POST', `/washes/${id}/accept`, undefined, joseph);
+  };
+
+  const bookPair = (token: string, cars: any[]) =>
+    call('POST', '/me/washes/promo', { branch_id: branchId, cars }, token);
+
   await act('Act 1 — sign-in and discovery', async () => {
     orgadmin = await signInAs('orgadmin');
     joseph = await signInAs('joseph');
     musa = await signInAs('musa');
     josephId = (await call('GET', '/me', undefined, joseph)).body?.data?.id;
     musaId = (await call('GET', '/me', undefined, musa)).body?.data?.id;
-    // A fresh client each run — the promo is one-time per client, so every
-    // suite run needs an account that has never seen the offer.
-    const clientPhone = '+2567' + String(Date.now() + 10).slice(-8);
-    client = await signInByPhone(clientPhone);
-    check('tokens acquired', !!orgadmin && !!musa && !!client);
-
-    const me = await call('GET', '/me', undefined, client);
-    orgId = me.body?.data?.org_id;
+    client = await signInByPhone(freshPhone());
+    check('tokens acquired', !!orgadmin && !!musa && !!joseph && !!client);
 
     const branches = await call('GET', '/branches', undefined, orgadmin);
     const branch = (branches.body?.data || []).find((b: any) => b.code === 'NTD');
     check('NTD branch found', !!branch);
     branchId = branch?.id;
-    branchCode = branch?.code;
 
     const prices = await call('GET', `/me/washes/prices?branch_id=${branchId}`, undefined, client);
-    const vc = (prices.body?.data?.vehicle_classes || []).find((v: any) => (v.services || []).some((s: any) => s.has_price));
-    const svc = vc?.services?.find((s: any) => s.has_price);
-    check('a priced service exists at NTD', !!vc && !!svc);
-    vcId = vc?.id; svcId = svc?.id; priceUgx = Number(svc?.price_ugx || 0);
+    const options: { vehicle_class_id: string; service_id: string; price: number }[] = [];
+    for (const vc of prices.body?.data?.vehicle_classes || []) {
+      for (const s of vc.services || []) {
+        if (s.has_price) options.push({ vehicle_class_id: vc.id, service_id: s.id, price: Number(s.price_ugx) });
+      }
+    }
+    options.sort((a, b) => a.price - b.price);
+    cheap = options[0] || null;
+    dear = options.find((o) => o.price > (cheap?.price ?? 0)) || null;
+    check('two priced cars at different prices exist at NTD', !!cheap && !!dear,
+      JSON.stringify({ cheap, dear }));
 
-    // Both workers freed: auto-assign may pick either, and the suite
-    // drives whichever one actually got the wash (handover rule).
+    // Both workers freed: the suite drives whichever one takes each car.
     await ensureFree(joseph, orgadmin);
     await ensureFree(musa, orgadmin);
   });
 
-  await act('Act 2 — promo state before grabbing: available', async () => {
+  await act('Act 2 — before booking: the offer is available', async () => {
     const state = await call('GET', '/me/washes/promo', undefined, client);
     check('promo endpoint 200 for a client', state.status === 200, 'status ' + state.status);
     check('offer is available', state.body?.data?.available === true && state.body?.data?.used === false,
       JSON.stringify(state.body));
   });
 
-  await act('Act 3 — grab: booking with use_promo arms the offer', async () => {
-    const book = await call('POST', '/me/washes', {
-      branch_id: branchId, vehicle_class_id: vcId, service_id: svcId,
-      plate: 'P13 GRAB', use_promo: true,
-    }, client);
-    washId = book.body?.data?.wash_id;
-    check('booking succeeds', book.status === 201, 'status ' + book.status + ' ' + JSON.stringify(book.body).slice(0, 200));
-    check('the grab booking pays full price (not a redemption)', book.body?.data?.is_redemption === false, JSON.stringify(book.body?.data));
-    check('response marks the offer earned', book.body?.data?.promo_earned === true, JSON.stringify(book.body?.data));
-
-    // A booking waits for its accept window (modules/dispatch); a free
-    // worker taking it is the normal path.
-    check('booking waits for a worker', book.body?.data?.status === 'requested', JSON.stringify(book.body?.data));
-    const acc = await call('POST', `/washes/${washId}/accept`, undefined, musa);
-    check('a free worker accepts it', acc.status === 200, JSON.stringify(acc.body).slice(0, 200));
-
-    const state = await call('GET', '/me/washes/promo', undefined, client);
-    check('promo now armed with active wash',
-      state.body?.data?.available === false && state.body?.data?.used === false && state.body?.data?.active_wash === true,
-      JSON.stringify(state.body));
-
-    // One-time per client: re-grabbing while the offer is armed cannot be
-    // attempted here (the one-active-wash guard refuses first), so the
-    // PROMO_CONFLICT path is asserted in Act 7 once the wash settles.
-  });
-
-  await act('Act 4 — cannot spend what is not earned yet (armed, not settled)', async () => {
-    // The paid wash has not settled — a use_promo_free booking must be
-    // refused: the reward is not spendable until the paid wash settles.
-    // (The client already has an active wash, so the server should refuse
-    // with ALREADY_REQUESTED first — either refusal is correct here; the
-    // specific guard is asserted in Act 6 when no active wash exists.)
-    const trySpend = await call('POST', '/me/washes', {
-      branch_id: branchId, vehicle_class_id: vcId, service_id: svcId, use_promo_free: true,
-    }, client);
-    check('free booking refused while another wash is active',
-      trySpend.status === 409, 'status ' + trySpend.status + ' ' + JSON.stringify(trySpend.body).slice(0, 200));
-  });
-
-  await act('Act 5 — paid wash settles: reward earned', async () => {
-    if (!washId) { check('prerequisites', false); return; }
-
-    const starter = await workerTokenFor(washId);
-    const wd = await call('POST', `/washes/${washId}/wash-done`, undefined, starter);
-    check('wash-done on the paid wash', wd.status === 200, JSON.stringify(wd.body).slice(0, 200));
-    const settle = await call('POST', `/washes/${washId}/settle`, { payment_method: 'cash', unverified_reason: 'no_app' }, starter);
-    check('paid wash settles at full price',
-      settle.status === 200 && Number(settle.body?.data?.amount_ugx) === priceUgx,
-      'status ' + settle.status + ' amount ' + settle.body?.data?.amount_ugx);
+  await act('Act 3 — one booking, two cars: the dearer is charged, the other free', async () => {
+    if (!cheap || !dear) { check('prerequisites', false); return; }
+    // The cheap car listed FIRST, so picking the charged car by price — not
+    // by position — is what is being tested.
+    const book = await bookPair(client, [
+      { vehicle_class_id: cheap.vehicle_class_id, service_id: cheap.service_id, plate: 'P13 CHEAP' },
+      { vehicle_class_id: dear.vehicle_class_id, service_id: dear.service_id, plate: 'P13 DEAR' },
+    ]);
+    pair = book.body?.data;
+    check('pair booking succeeds', book.status === 201, 'status ' + book.status + ' ' + JSON.stringify(book.body).slice(0, 300));
+    check('two washes, in the order listed', pair?.washes?.length === 2
+      && pair.washes[0].plate === 'P13 CHEAP' && pair.washes[1].plate === 'P13 DEAR', JSON.stringify(pair?.washes));
+    check('each car has its own job number', !!pair?.washes?.[0]?.job_no && pair.washes[0].job_no !== pair.washes[1].job_no);
+    check('the dearer car is the charged one', pair?.paid_wash_id === pair?.washes?.[1]?.wash_id, JSON.stringify(pair));
+    check('the cheaper car is free', pair?.washes?.[0]?.is_redemption === true && pair.washes[0].amount_due_ugx === 0,
+      JSON.stringify(pair?.washes?.[0]));
+    check('the client owes the dearer price only', Number(pair?.amount_due_ugx) === dear.price,
+      `owes ${pair?.amount_due_ugx}, dear ${dear.price}`);
 
     const state = await call('GET', '/me/washes/promo', undefined, client);
-    check('promo armed and ready to spend (no active wash)',
-      state.body?.data?.available === false && state.body?.data?.used === false && state.body?.data?.active_wash === false,
-      JSON.stringify(state.body));
+    check('the offer is taken the moment it is booked',
+      state.body?.data?.used === true && state.body?.data?.available === false, JSON.stringify(state.body));
+
+    const active = await call('GET', '/me/washes/active-list', undefined, client);
+    const ids = (active.body?.data || []).map((w: any) => w.id);
+    check('both cars are on the client\'s active list',
+      ids.includes(pair?.washes?.[0]?.wash_id) && ids.includes(pair?.washes?.[1]?.wash_id), JSON.stringify(ids));
+    const freeRow = (active.body?.data || []).find((w: any) => w.id === pair?.free_wash_id);
+    check('the free car shows nothing to pay, marked as the offer\'s',
+      Number(freeRow?.amount_due_ugx) === 0 && freeRow?.promo_key === 'wash2_price1', JSON.stringify(freeRow));
   });
 
-  await act('Act 6 — the free wash: booked free, settled without burning a credit', async () => {
-    // Book the free one with use_promo_free — the server must not charge,
-    // must not touch the client's loyalty credits, and must not stamp an
-    // extra wash_count.
+  await act('Act 4 — the offer cannot be taken twice', async () => {
+    if (!cheap || !dear) { check('prerequisites', false); return; }
+    const again = await bookPair(client, [
+      { vehicle_class_id: cheap.vehicle_class_id, service_id: cheap.service_id },
+      { vehicle_class_id: dear.vehicle_class_id, service_id: dear.service_id },
+    ]);
+    check('second offer booking refused with PROMO_CONFLICT',
+      again.status === 409 && again.body?.error?.code === 'PROMO_CONFLICT',
+      'status ' + again.status + ' ' + JSON.stringify(again.body));
+
+    const one = await call('POST', '/me/washes/promo', { branch_id: branchId, cars: [{ vehicle_class_id: cheap.vehicle_class_id }] }, client);
+    check('an offer booking needs exactly two cars', one.status === 400, 'status ' + one.status);
+  });
+
+  await act('Act 5 — another car can be booked while these are on the go', async () => {
+    if (!cheap) { check('prerequisites', false); return; }
+    const extra = await call('POST', '/me/washes', {
+      branch_id: branchId, vehicle_class_id: cheap.vehicle_class_id, service_id: cheap.service_id, plate: 'P13 EXTRA',
+    }, client);
+    check('a normal booking alongside the pair goes through', extra.status === 201,
+      'status ' + extra.status + ' ' + JSON.stringify(extra.body).slice(0, 200));
+    check('it is an ordinary paid booking', extra.body?.data?.is_redemption === false, JSON.stringify(extra.body?.data));
+
+    // Out of the way of the rest of the suite.
+    const cancel = await call('POST', `/me/washes/${extra.body?.data?.wash_id}/cancel-request`, undefined, client);
+    check('and the client can cancel it while it waits', cancel.status === 200, JSON.stringify(cancel.body).slice(0, 200));
+  });
+
+  await act('Act 6 — both cars washed: the charged one paid, the free one at 0', async () => {
+    if (!pair || !dear) { check('prerequisites', false); return; }
     const loyaltyBefore = await call('GET', '/me/washes/loyalty', undefined, client);
     const creditsBefore = Number(loyaltyBefore.body?.data?.free_wash_credits || 0);
-
-    // The client's paid wash earned a stamp; force the credit situation to
-    // a known state by reading wash_count before, too.
     const washCountBefore = Number(loyaltyBefore.body?.data?.wash_count || 0);
 
-    const book = await call('POST', '/me/washes', {
-      branch_id: branchId, vehicle_class_id: vcId, service_id: svcId,
-      plate: 'P13 FREE', use_promo_free: true,
-    }, client);
-    const freeWashId = book.body?.data?.wash_id;
-    check('free booking succeeds', book.status === 201, 'status ' + book.status + ' ' + JSON.stringify(book.body).slice(0, 300));
-    check('free booking is a redemption at zero', book.body?.data?.is_redemption === true, JSON.stringify(book.body?.data));
-
-    // Complete + settle it — whoever the auto-assign (or manual accept)
-    // actually attached it to. Both workers are free after Act 5, so
-    // auto-assign should have taken it; the accept fallback is here so the
-    // suite still passes if seeding leaves one worker occupied.
-    if (book.body?.data?.status === 'requested') {
-      const manual = await call('POST', `/washes/${freeWashId}/accept`, undefined, musa);
-      if (manual.status !== 200) {
-        await call('POST', `/washes/${freeWashId}/accept`, undefined, joseph);
-      }
+    for (const w of pair.washes) {
+      const acc = await acceptAny(w.wash_id);
+      check(`car ${w.plate} accepted by a worker`, acc.status === 200, JSON.stringify(acc.body).slice(0, 200));
     }
-    const freeStarter = await workerTokenFor(freeWashId);
-    const wd = await call('POST', `/washes/${freeWashId}/wash-done`, undefined, freeStarter);
-    check('wash-done on the free wash', wd.status === 200, JSON.stringify(wd.body).slice(0, 200));
-    const settle = await call('POST', `/washes/${freeWashId}/settle`, { unverified_reason: 'no_app' }, freeStarter);
-    check('free wash settles at 0', settle.status === 200 && Number(settle.body?.data?.amount_ugx) === 0,
-      'status ' + settle.status + ' amount ' + settle.body?.data?.amount_ugx);
 
-    // THE core assertion: the client's earned credits are untouched.
+    const pointsBefore = Number((await call('GET', '/me/washes/points', undefined, client)).body?.data?.balance || 0);
+
+    const paidStarter = await workerTokenFor(pair.paid_wash_id);
+    await call('POST', `/washes/${pair.paid_wash_id}/wash-done`, undefined, paidStarter);
+    const paidSettle = await call('POST', `/washes/${pair.paid_wash_id}/settle`,
+      { payment_method: 'cash', unverified_reason: 'no_app' }, paidStarter);
+    check('the charged car settles at its full price',
+      paidSettle.status === 200 && Number(paidSettle.body?.data?.amount_ugx) === dear.price,
+      'status ' + paidSettle.status + ' amount ' + paidSettle.body?.data?.amount_ugx);
+
+    const pointsAfterPaid = Number((await call('GET', '/me/washes/points', undefined, client)).body?.data?.balance || 0);
+    check('the charged car earns its points as usual',
+      pointsAfterPaid - pointsBefore === Number(pair.client_points_to_award),
+      `before ${pointsBefore} after ${pointsAfterPaid} expected +${pair.client_points_to_award}`);
+
+    const freeStarter = await workerTokenFor(pair.free_wash_id);
+    await call('POST', `/washes/${pair.free_wash_id}/wash-done`, undefined, freeStarter);
+    const freeSettle = await call('POST', `/washes/${pair.free_wash_id}/settle`, { unverified_reason: 'no_app' }, freeStarter);
+    check('the free car settles at 0', freeSettle.status === 200 && Number(freeSettle.body?.data?.amount_ugx) === 0,
+      'status ' + freeSettle.status + ' ' + JSON.stringify(freeSettle.body).slice(0, 200));
+
+    const pointsAfterFree = Number((await call('GET', '/me/washes/points', undefined, client)).body?.data?.balance || 0);
+    check('the free car earns no points', pointsAfterFree === pointsAfterPaid, `${pointsAfterPaid} → ${pointsAfterFree}`);
+
+    // The free car is the offer, not a loyalty credit.
     const loyaltyAfter = await call('GET', '/me/washes/loyalty', undefined, client);
-    check('no free_wash_credit was consumed by the promo',
+    check('no free_wash_credit was consumed by the offer',
       Number(loyaltyAfter.body?.data?.free_wash_credits || 0) === creditsBefore,
       `before ${creditsBefore} after ${loyaltyAfter.body?.data?.free_wash_credits}`);
-    check('no extra loyalty stamp for the free wash',
+    check('no extra loyalty stamp for the free car',
       Number(loyaltyAfter.body?.data?.wash_count || 0) === washCountBefore,
       `before ${washCountBefore} after ${loyaltyAfter.body?.data?.wash_count}`);
 
     const state = await call('GET', '/me/washes/promo', undefined, client);
-    check('offer is now used', state.body?.data?.used === true, JSON.stringify(state.body));
+    check('the offer stays used, now fully redeemed',
+      state.body?.data?.used === true && state.body?.data?.status === 'used', JSON.stringify(state.body));
   });
 
-  await act('Act 7 — after use: stale flags are refused cleanly', async () => {
-    // A stale client (or a second device) retrying use_promo_free must get
-    // PROMO_UNAVAILABLE, never a silent full-price booking.
-    const stale = await call('POST', '/me/washes', {
-      branch_id: branchId, vehicle_class_id: vcId, service_id: svcId, use_promo_free: true,
-    }, client);
-    check('stale use_promo_free refused with PROMO_UNAVAILABLE',
-      stale.status === 409 && stale.body?.error?.code === 'PROMO_UNAVAILABLE',
-      'status ' + stale.status + ' ' + JSON.stringify(stale.body));
+  await act('Act 7 — the charged car cancelled: its partner pays, the offer comes back', async () => {
+    if (!cheap || !dear) { check('prerequisites', false); return; }
+    const fresh = await signInByPhone(freshPhone());
+    const book = await bookPair(fresh, [
+      { vehicle_class_id: cheap.vehicle_class_id, service_id: cheap.service_id, plate: 'P13 C7A' },
+      { vehicle_class_id: dear.vehicle_class_id, service_id: dear.service_id, plate: 'P13 C7B' },
+    ]);
+    const p = book.body?.data;
+    check('pair booked', book.status === 201, JSON.stringify(book.body).slice(0, 200));
 
-    const regab = await call('POST', '/me/washes', {
-      branch_id: branchId, vehicle_class_id: vcId, service_id: svcId, use_promo: true,
-    }, client);
-    check('re-grab after use refused with PROMO_CONFLICT',
-      regab.status === 409 && regab.body?.error?.code === 'PROMO_CONFLICT',
-      'status ' + regab.status + ' ' + JSON.stringify(regab.body));
-  });
+    const cancel = await call('POST', `/me/washes/${p?.paid_wash_id}/cancel-request`, undefined, fresh);
+    check('charged car cancelled', cancel.status === 200, JSON.stringify(cancel.body).slice(0, 200));
 
-  await act('Act 8 — client-cancel unwinds an armed grab (re-grab possible)', async () => {
-    // Fresh client: grab, then cancel the unclaimed booking — the armed
-    // row must be deleted so the offer is available again.
-    const freshPhone = '+2567' + String(Date.now() + 12).slice(-8);
-    const fresh = await signInByPhone(freshPhone);
-
-    const grab = await call('POST', '/me/washes', {
-      branch_id: branchId, vehicle_class_id: vcId, service_id: svcId, use_promo: true,
-    }, fresh);
-    const grabWashId = grab.body?.data?.wash_id;
-    check('fresh grab succeeds', grab.status === 201, JSON.stringify(grab.body).slice(0, 200));
-
-    // If auto-assigned, cancel via staff route (same unwinding logic).
-    const cancelReq = await call('POST', `/me/washes/${grabWashId}/cancel-request`, undefined, fresh);
-    if (cancelReq.status !== 200) {
-      await call('POST', `/washes/${grabWashId}/cancel`, { reason: 'other', note: 'phase13 unwind' }, orgadmin);
-    }
+    const active = await call('GET', '/me/washes/active-list', undefined, fresh);
+    const left = (active.body?.data || []).find((w: any) => w.id === p?.free_wash_id);
+    check('the other car carries on, now at its own price',
+      !!left && left.is_redemption === false && Number(left.amount_due_ugx) === cheap.price && left.promo_key === null,
+      JSON.stringify(left));
 
     const state = await call('GET', '/me/washes/promo', undefined, fresh);
-    check('offer available again after cancelling the grab booking',
-      state.body?.data?.available === true,
-      JSON.stringify(state.body));
+    check('the offer is available again', state.body?.data?.available === true, JSON.stringify(state.body));
+
+    await call('POST', `/me/washes/${p?.free_wash_id}/cancel-request`, undefined, fresh);
+  });
+
+  await act('Act 8 — the free car cancelled: the charged car carries on, the offer comes back', async () => {
+    if (!cheap || !dear) { check('prerequisites', false); return; }
+    const fresh = await signInByPhone(freshPhone());
+    const book = await bookPair(fresh, [
+      { vehicle_class_id: dear.vehicle_class_id, service_id: dear.service_id, plate: 'P13 C8A' },
+      { vehicle_class_id: cheap.vehicle_class_id, service_id: cheap.service_id, plate: 'P13 C8B' },
+    ]);
+    const p = book.body?.data;
+    check('pair booked (dearer listed first this time)',
+      book.status === 201 && p?.paid_wash_id === p?.washes?.[0]?.wash_id, JSON.stringify(book.body).slice(0, 300));
+
+    // Through the staff route this time — the same unwinding applies.
+    const cancel = await call('POST', `/washes/${p?.free_wash_id}/cancel`, { reason: 'other', note: 'phase13 free car' }, orgadmin);
+    check('free car cancelled by staff', cancel.status === 200, JSON.stringify(cancel.body).slice(0, 200));
+
+    const active = await call('GET', '/me/washes/active-list', undefined, fresh);
+    const left = (active.body?.data || []).find((w: any) => w.id === p?.paid_wash_id);
+    check('the charged car carries on at its price',
+      !!left && left.is_redemption === false && Number(left.amount_due_ugx) === dear.price, JSON.stringify(left));
+
+    const state = await call('GET', '/me/washes/promo', undefined, fresh);
+    check('the offer is available again', state.body?.data?.available === true, JSON.stringify(state.body));
+
+    await call('POST', `/me/washes/${p?.paid_wash_id}/cancel-request`, undefined, fresh);
   });
 
   console.log(`\n══════ PHASE 13: ${pass} passed, ${failCount} failed ══════`);

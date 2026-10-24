@@ -41,6 +41,23 @@ router.get('/daily', requireRole('orgadmin', 'manager'), async (req: Request, re
 
     params.push(date);
 
+    // Optional `until=HH:MM`: only washes started by that time of day — so a
+    // dashboard can compare today so far with the same day last week up to
+    // the same time, not with that whole day (Toast "same time", DRB
+    // "period to date"). Applies to every section below.
+    const until = typeof req.query.until === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(req.query.until)
+      ? req.query.until
+      : null;
+    if (req.query.until !== undefined && !until) {
+      next(createAppError(400, 'VALIDATION_ERROR', 'until must be HH:MM (24-hour)'));
+      return;
+    }
+    const dayPIdx = pIdx + 1;
+    if (until) {
+      params.push(until);
+      branchClause += ` AND w.started_at::time <= $${dayPIdx + 1}::time`;
+    }
+
     // Summary
     const summary = await pool.query(`
       SELECT
@@ -100,6 +117,7 @@ router.get('/daily', requireRole('orgadmin', 'manager'), async (req: Request, re
       ok: true,
       data: {
         date,
+        until,
         summary: summary.rows[0],
         by_car_type: byCarType.rows,
         by_service: byService.rows,

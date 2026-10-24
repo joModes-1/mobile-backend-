@@ -7,6 +7,9 @@
  *   - a cash wash leaves the settler owing (cash − their commission);
  *   - a manager confirming cash brings the balance back, partially or fully,
  *     never beyond what is owed;
+ *   - the balance is shown as two pots — cash still to hand in, and the
+ *     account (withdrawable) — and commission in the account never shrinks
+ *     the cash a manager may take in;
  *   - mobile money and points-paid washes add commission and owe nothing;
  *   - on a handover the washer gets the commission, the settler owes the cash;
  *   - shift expected cash counts only cash (the old bug counted mobile money);
@@ -104,6 +107,15 @@ async function main() {
     await call('POST', `/washes/${washId}/wash-done`, undefined, token);
     return call('POST', `/washes/${washId}/settle`, { unverified_reason: 'no_app', ...body }, token);
   }
+  /** Books washes until one lands on this worker (the dispatcher picks who). */
+  async function bookFor(workerId: string, extra: Record<string, unknown> = {}, clientToken?: string) {
+    for (let i = 0; i < 6; i++) {
+      const b = await bookAssigned(extra, clientToken);
+      if (b.holder === workerId) return b;
+      await call('POST', `/washes/${b.washId}/cancel`, { reason: 'other', note: 'v2-phase2 setup' }, orgadmin);
+    }
+    throw new Error('could not land a wash on ' + workerId);
+  }
   async function expectedCash(token: string) {
     return Number((await call('GET', '/shifts/current', undefined, token)).body?.data?.expected_cash_ugx ?? NaN);
   }
@@ -155,6 +167,8 @@ async function main() {
   await act('Act 2 — cash wash: settler owes cash minus their commission', async () => {
     const { washId, holder } = await bookAssigned();
     const before = await balanceOf(holder);
+    const pre = await wallet(tokenFor(holder));
+    const owesBefore = pre.owes_ugx;
     const shiftBefore = await expectedCash(tokenFor(holder));
     const s = await finish(washId, tokenFor(holder), { payment_method: 'cash' });
     check('settle reports commission on the full price', s.body?.data?.worker_commission_ugx === commission(price),
@@ -164,7 +178,19 @@ async function main() {
       `before ${before} after ${after}`);
     check('settle reports the wallet balance', s.body?.data?.wallet_balance_ugx === after);
     const w = await wallet(tokenFor(holder));
-    check('owes_ugx mirrors a negative balance', w.owes_ugx === Math.max(0, -after) && w.available_ugx === Math.max(0, after));
+    check('cash to hand in rose by cash − commission', w.owes_ugx - owesBefore === price - commission(price),
+      `before ${owesBefore} after ${w.owes_ugx}`);
+    check('the pots add up: balance = account − cash owed',
+      w.balance_ugx === w.account_ugx - w.owes_ugx && w.available_ugx === Math.max(0, w.account_ugx), JSON.stringify(w).slice(0, 200));
+    check('commission kept from cash is NOT added to the account', w.account_ugx === pre.account_ugx,
+      `account ${pre.account_ugx}→${w.account_ugx}`);
+    check('commission split: today\'s "kept from cash" rose by the commission, "into account" did not',
+      w.commission.today.cash_ugx - pre.commission.today.cash_ugx === commission(price)
+        && w.commission.today.account_ugx === pre.commission.today.account_ugx,
+      JSON.stringify({ before: pre.commission.today, after: w.commission.today }));
+    check('commission total = into account + kept from cash',
+      w.commission.today_ugx === w.commission.today.account_ugx + w.commission.today.cash_ugx
+        && w.commission.month_ugx === w.commission.month.account_ugx + w.commission.month.cash_ugx);
     check('ledger shows commission and cash rows for the wash',
       w.ledger.some((r: any) => r.wash_id === washId && r.kind === 'commission' && r.amount_ugx === commission(price))
         && w.ledger.some((r: any) => r.wash_id === washId && r.kind === 'cash_collected' && r.amount_ugx === -price));
@@ -186,7 +212,8 @@ async function main() {
     check('partial handover accepted', part.status === 200 && part.body?.data?.owes_ugx === owed - 1000, JSON.stringify(part.body));
 
     const rest = await call('POST', `/wallet/${holder}/cash-handover`, { amount_ugx: owed - 1000 }, grace);
-    check('the rest clears the debt', rest.status === 200 && rest.body?.data?.balance_ugx === 0, JSON.stringify(rest.body));
+    check('the rest clears the cash', rest.status === 200 && rest.body?.data?.owes_ugx === 0
+      && rest.body?.data?.balance_ugx === rest.body?.data?.account_ugx, JSON.stringify(rest.body));
 
     const nothing = await call('POST', `/wallet/${holder}/cash-handover`, { amount_ugx: 500 }, grace);
     check('nothing owed → 409', nothing.status === 409 && nothing.body?.error?.code === 'NOTHING_OWED');
@@ -198,11 +225,20 @@ async function main() {
   await act('Act 4 — mobile money: commission paid in, nothing owed, no cash expected', async () => {
     const { washId, holder } = await bookAssigned();
     const before = await balanceOf(holder);
+    const pre = await wallet(tokenFor(holder));
     const shiftBefore = await expectedCash(tokenFor(holder));
     const s = await finish(washId, tokenFor(holder), { payment_method: 'mtn', payer_phone: '+256770000001' });
     check('settled as mtn with commission', s.status === 200 && s.body?.data?.payment_method === 'mtn'
       && s.body?.data?.worker_commission_ugx === commission(price), JSON.stringify(s.body?.data).slice(0, 300));
     check('wallet rose by the commission', (await balanceOf(holder)) - before === commission(price));
+    const post = await wallet(tokenFor(holder));
+    check('the commission lands in the account; cash to hand in unchanged',
+      post.account_ugx - pre.account_ugx === commission(price) && post.owes_ugx === pre.owes_ugx,
+      `account ${pre.account_ugx}→${post.account_ugx}, owes ${pre.owes_ugx}→${post.owes_ugx}`);
+    check('commission split: "into account" rose, "kept from cash" did not',
+      post.commission.today.account_ugx - pre.commission.today.account_ugx === commission(price)
+        && post.commission.today.cash_ugx === pre.commission.today.cash_ugx,
+      JSON.stringify({ before: pre.commission.today, after: post.commission.today }));
     check('shift expected cash unchanged (mobile money is not cash in hand)',
       (await expectedCash(tokenFor(holder))) === shiftBefore);
   });
@@ -227,6 +263,7 @@ async function main() {
     const { washId, holder } = await bookAssigned();
     const otherId = holder === josephId ? musaId : josephId;
     const washerBefore = await balanceOf(holder);
+    const washerPre = await wallet(tokenFor(holder));
     const settlerBefore = await balanceOf(otherId);
     const settlerShift = await expectedCash(tokenFor(otherId));
 
@@ -236,6 +273,12 @@ async function main() {
     }, tokenFor(otherId));
     check('handover settle succeeds', s.status === 200 && s.body?.data?.is_handover === true, JSON.stringify(s.body).slice(0, 300));
     check('washer +commission', (await balanceOf(holder)) - washerBefore === commission(price));
+    const washerPost = await wallet(tokenFor(holder));
+    check('washer never touched the notes, so the commission goes into their account',
+      washerPost.account_ugx - washerPre.account_ugx === commission(price)
+        && washerPost.commission.today.account_ugx - washerPre.commission.today.account_ugx === commission(price)
+        && washerPost.commission.today.cash_ugx === washerPre.commission.today.cash_ugx,
+      JSON.stringify({ before: washerPre.commission.today, after: washerPost.commission.today }));
     check('settler −full cash', (await balanceOf(otherId)) - settlerBefore === -price);
     check('settler\'s shift expects the full cash (the commission is not theirs to keep)',
       (await expectedCash(tokenFor(otherId))) - settlerShift === price);
@@ -247,15 +290,64 @@ async function main() {
         && !(settlerEarnings.body?.data?.recent || []).some((w: any) => w.id === washId));
   });
 
+  await act('Act 6b — two pots: account commission never shrinks the cash to hand in', async () => {
+    // Start Joseph with no cash in hand.
+    const start = await wallet(joseph);
+    if (start.owes_ugx > 0) await call('POST', `/wallet/${josephId}/cash-handover`, { amount_ugx: start.owes_ugx }, grace);
+
+    const mm = await bookFor(josephId);
+    await finish(mm.washId, joseph, { payment_method: 'mtn', payer_phone: '+256770000002' });
+    const cash = await bookFor(josephId);
+    await finish(cash.washId, joseph, { payment_method: 'cash' });
+
+    const w = await wallet(joseph);
+    check('cash to hand in = cash − commission of the cash wash', w.owes_ugx === price - commission(price), 'owes ' + w.owes_ugx);
+    check('account holds the mobile-money commission (and is withdrawable)',
+      w.account_ugx > 0 && w.available_ugx === w.account_ugx, `account ${w.account_ugx}`);
+    check('so the cash owed is more than the net balance shows', w.owes_ugx > Math.max(0, -w.balance_ugx),
+      `owes ${w.owes_ugx}, balance ${w.balance_ugx}`);
+
+    const all = await call('POST', `/wallet/${josephId}/cash-handover`, { amount_ugx: w.owes_ugx }, grace);
+    check('manager can take in ALL the cash, beyond the net balance', all.status === 200 && all.body?.data?.owes_ugx === 0,
+      JSON.stringify(all.body).slice(0, 300));
+    check('handing in cash leaves the account untouched', all.body?.data?.account_ugx === w.account_ugx,
+      `account ${w.account_ugx} → ${all.body?.data?.account_ugx}`);
+  });
+
+  await act('Act 6c — points cover most of a cash wash: commission beyond the cash goes to the account', async () => {
+    const c = await signInByPhone(freshPhone());
+    const cid = (await call('GET', '/me', undefined, c)).body?.data?.id;
+    const pv = Number((await call('GET', '/me/washes/points', undefined, c)).body?.data?.point_value_ugx || 0);
+    // Points worth ~95% of the price, so the cash left (~5%) is less than the 10% commission.
+    await call('POST', '/settings/client-points/adjust', { client_id: cid, points: Math.floor((price * 0.95) / pv), reason: 'v2-phase2 fixture' }, orgadmin);
+    const { washId, holder } = await bookFor(josephId, { use_points: true }, c);
+    const pre = await wallet(tokenFor(holder));
+    const s = await finish(washId, tokenFor(holder), { payment_method: 'cash' });
+    const cashPaid = Number(s.body?.data?.amount_ugx);
+    check('client paid some cash, less than the commission', cashPaid > 0 && cashPaid < commission(price), 'cash ' + cashPaid);
+    const post = await wallet(tokenFor(holder));
+    check('nothing more to hand in', post.owes_ugx === pre.owes_ugx, `owes ${pre.owes_ugx}→${post.owes_ugx}`);
+    check('account rose by commission − cash kept', post.account_ugx - pre.account_ugx === commission(price) - cashPaid,
+      `account ${pre.account_ugx}→${post.account_ugx}`);
+  });
+
   await act('Act 7 — reversal undoes the wash\'s money', async () => {
     const { washId, holder } = await bookAssigned();
     const before = await balanceOf(holder);
+    const revPre = await wallet(tokenFor(holder));
+    const owesBefore = revPre.owes_ugx;
     await finish(washId, tokenFor(holder), { payment_method: 'cash' });
     const rev = await call('POST', `/washes/${washId}/reverse`, { reason: 'v2-phase2 reversal' }, orgadmin);
     check('reverse succeeds and reports the wallet change',
       rev.status === 200 && (rev.body?.data?.wallet || []).some((x: any) => x.staff_id === holder && x.amount_ugx === price - commission(price)),
       JSON.stringify(rev.body?.data?.wallet));
     check('balance back where it started', (await balanceOf(holder)) === before);
+    const revPost = await wallet(tokenFor(holder));
+    check('cash to hand in back where it started', revPost.owes_ugx === owesBefore);
+    check('a reversed wash drops out of the commission split',
+      revPost.commission.today.cash_ugx === revPre.commission.today.cash_ugx
+        && revPost.commission.today.account_ugx === revPre.commission.today.account_ugx,
+      JSON.stringify({ before: revPre.commission.today, after: revPost.commission.today }));
   });
 
   await act('Act 8 — correction moves the wallet by the difference', async () => {
@@ -294,7 +386,8 @@ async function main() {
     const rows = list.body?.data?.staff || [];
     check('lists joseph and musa', rows.some((r: any) => r.staff_id === josephId) && rows.some((r: any) => r.staff_id === musaId));
     check('only NTD workers', rows.every((r: any) => r.branch_id === branchId && r.role === 'worker'));
-    check('sorted by balance, most owed first', rows.every((r: any, i: number) => i === 0 || rows[i - 1].balance_ugx <= r.balance_ugx));
+    check('sorted by cash to hand in, most first', rows.every((r: any, i: number) => i === 0 || rows[i - 1].owes_ugx >= r.owes_ugx));
+    check('every row\'s pots add up', rows.every((r: any) => r.balance_ugx === r.account_ugx - r.owes_ugx));
     check('total owed is the sum', list.body?.data?.total_owed_ugx === rows.reduce((t: number, r: any) => t + r.owes_ugx, 0));
   });
 

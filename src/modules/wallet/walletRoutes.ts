@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { getPool } from '@/db';
 import { createAppError } from '@/middleware/errorHandler';
 import { requireRole, getOrgId } from '@/middleware/requireRole';
-import { getAccount, cashHandover, post } from '@/modules/wallet';
+import { getAccount, cashHandover, post, cashOwed, cashOwedFor } from '@/modules/wallet';
 
 /**
  * Worker wallet endpoints.
@@ -16,13 +16,23 @@ import { getAccount, cashHandover, post } from '@/modules/wallet';
  */
 const router = Router();
 
-function walletView(acct: { balance_ugx: number; lifetime_commission_ugx: number; lifetime_withdrawn_ugx: number }) {
+/**
+ * One balance, shown as its two pots (see cashOwedFor):
+ *   owes_ugx      cash the worker still has to hand in;
+ *   account_ugx   their account — balance + cash owed; can be negative
+ *                 (e.g. commission reversed after it was withdrawn);
+ *   available_ugx what they may withdraw: the account, whatever cash they hold.
+ */
+function walletView(
+  acct: { balance_ugx: number; lifetime_commission_ugx: number; lifetime_withdrawn_ugx: number },
+  owedUgx: number
+) {
+  const account = acct.balance_ugx + owedUgx;
   return {
     balance_ugx: acct.balance_ugx,
-    // Negative balance = cash the worker holds for the business.
-    owes_ugx: Math.max(0, -acct.balance_ugx),
-    // Positive balance = money the worker can withdraw (Phase 6).
-    available_ugx: Math.max(0, acct.balance_ugx),
+    owes_ugx: owedUgx,
+    account_ugx: account,
+    available_ugx: Math.max(0, account),
     lifetime_commission_ugx: acct.lifetime_commission_ugx,
     lifetime_withdrawn_ugx: acct.lifetime_withdrawn_ugx,
   };
@@ -31,9 +41,12 @@ function walletView(acct: { balance_ugx: number; lifetime_commission_ugx: number
 async function ledgerFor(staffId: string, limit = 50) {
   const r = await getPool().query(
     `SELECT l.id, l.kind, l.amount_ugx, l.balance_after_ugx, l.reason, l.created_at,
-            l.wash_id, w.job_no, w.payment_method, su.full_name AS created_by_name
+            l.wash_id, w.job_no, w.payment_method, su.full_name AS created_by_name,
+            s.name AS service_name, vc.name AS vehicle_class_name
        FROM wallet_ledger l
        LEFT JOIN washes w ON w.id = l.wash_id
+       LEFT JOIN services s ON s.id = w.service_id
+       LEFT JOIN vehicle_classes vc ON vc.id = w.vehicle_class_id
        LEFT JOIN staff_users su ON su.id = l.created_by
       WHERE l.staff_id = $1
       ORDER BY l.seq DESC
@@ -88,23 +101,55 @@ router.get('/me', requireRole('orgadmin', 'manager', 'worker'), async (req: Requ
     const staffId = req.actor!.sub;
     const acct = await getAccount(pool, staffId, getOrgId(req.actor!));
 
-    // Commission net of any reversals/corrections, by period — what the
-    // worker actually earned, as the ledger records it.
+    // Commission by period, split by where it went — the same rule as the
+    // two pots (cashOwedFor):
+    //   cash     kept out of the notes: on a cash wash the worker washed AND
+    //            settled, as much of the commission as the cash covers;
+    //   account  everything else — mobile money, points, free washes, a
+    //            car someone else took the cash for, and any commission the
+    //            cash didn't cover.
+    // From the washes themselves (their current commission and cash, after
+    // any correction), so a reversed wash drops out of every figure.
     const periods = await pool.query(
-      `SELECT
-         COALESCE(SUM(amount_ugx) FILTER (WHERE created_at >= CURRENT_DATE), 0) AS today,
-         COALESCE(SUM(amount_ugx) FILTER (WHERE created_at >= date_trunc('week', CURRENT_DATE)), 0) AS week,
-         COALESCE(SUM(amount_ugx) FILTER (WHERE created_at >= date_trunc('month', CURRENT_DATE)), 0) AS month
-       FROM wallet_ledger
-      WHERE staff_id = $1 AND kind = 'commission'`,
+      `WITH earned AS (
+         SELECT w.settled_at,
+                w.worker_commission_ugx AS commission,
+                CASE WHEN w.payment_method = 'cash' AND w.settled_by_worker_id = w.started_by_worker_id
+                     THEN LEAST(w.worker_commission_ugx, GREATEST(w.amount_ugx, 0)) ELSE 0 END AS kept
+           FROM washes w
+          WHERE w.started_by_worker_id = $1
+            AND w.status IN ('settled', 'disputed')
+            AND w.worker_commission_ugx > 0
+            AND w.settled_at >= LEAST(date_trunc('week', CURRENT_DATE), date_trunc('month', CURRENT_DATE))
+       )
+       SELECT
+         COALESCE(SUM(kept) FILTER (WHERE settled_at >= CURRENT_DATE), 0) AS today_cash,
+         COALESCE(SUM(commission - kept) FILTER (WHERE settled_at >= CURRENT_DATE), 0) AS today_account,
+         COALESCE(SUM(kept) FILTER (WHERE settled_at >= date_trunc('week', CURRENT_DATE)), 0) AS week_cash,
+         COALESCE(SUM(commission - kept) FILTER (WHERE settled_at >= date_trunc('week', CURRENT_DATE)), 0) AS week_account,
+         COALESCE(SUM(kept) FILTER (WHERE settled_at >= date_trunc('month', CURRENT_DATE)), 0) AS month_cash,
+         COALESCE(SUM(commission - kept) FILTER (WHERE settled_at >= date_trunc('month', CURRENT_DATE)), 0) AS month_account
+       FROM earned`,
       [staffId]
     );
     const p = periods.rows[0];
+    const split = (period: 'today' | 'week' | 'month') => ({
+      account_ugx: Number(p[`${period}_account`]),
+      cash_ugx: Number(p[`${period}_cash`]),
+    });
+    const today = split('today');
+    const week = split('week');
+    const month = split('month');
     res.json({
       ok: true,
       data: {
-        ...walletView(acct),
-        commission: { today_ugx: Number(p.today), week_ugx: Number(p.week), month_ugx: Number(p.month) },
+        ...walletView(acct, await cashOwed(pool, staffId)),
+        commission: {
+          today_ugx: today.account_ugx + today.cash_ugx,
+          week_ugx: week.account_ugx + week.cash_ugx,
+          month_ugx: month.account_ugx + month.cash_ugx,
+          today, week, month,
+        },
         ledger: await ledgerFor(staffId),
       },
     });
@@ -143,10 +188,10 @@ router.get('/', requireRole('orgadmin', 'manager'), async (req: Request, res: Re
          LEFT JOIN wallet_accounts wa ON wa.staff_id = su.id
          LEFT JOIN branches b ON b.id = su.branch_id
         WHERE su.org_id = $1 AND su.role IN ('worker', 'manager') ${scope}
-        ORDER BY COALESCE(wa.balance_ugx, 0) ASC, su.full_name`,
+        ORDER BY su.full_name`,
       params
     );
-    // Most-owed first, so the cash to collect is at the top of the list.
+    const owed = await cashOwedFor(getPool(), r.rows.map((row: any) => row.staff_id));
     const rows = r.rows.map((row: any) => ({
       staff_id: row.staff_id, full_name: row.full_name, role: row.role,
       branch_id: row.branch_id, branch_name: row.branch_name, updated_at: row.updated_at,
@@ -156,8 +201,10 @@ router.get('/', requireRole('orgadmin', 'manager'), async (req: Request, res: Re
         balance_ugx: Number(row.balance_ugx),
         lifetime_commission_ugx: Number(row.lifetime_commission_ugx),
         lifetime_withdrawn_ugx: Number(row.lifetime_withdrawn_ugx),
-      }),
+      }, owed.get(row.staff_id) ?? 0),
     }));
+    // Most cash to collect first; the order from the query (by name) breaks ties.
+    rows.sort((a: any, b: any) => b.owes_ugx - a.owes_ugx);
     res.json({
       ok: true,
       data: {
@@ -177,7 +224,8 @@ router.get('/:staffId/ledger', requireRole('orgadmin', 'manager'), async (req: R
     const target = await loadTarget(req, next, { allowSelf: true });
     if (!target) return;
     const acct = await getAccount(getPool(), target.id, target.org_id);
-    res.json({ ok: true, data: { staff_id: target.id, full_name: target.full_name, ...walletView(acct), ledger: await ledgerFor(target.id, 200) } });
+    const owed = await cashOwed(getPool(), target.id);
+    res.json({ ok: true, data: { staff_id: target.id, full_name: target.full_name, ...walletView(acct, owed), ledger: await ledgerFor(target.id, 200) } });
   } catch (err) {
     next(err);
   }
@@ -211,8 +259,9 @@ router.post('/:staffId/cash-handover', requireRole('orgadmin', 'manager'), async
        VALUES ($1, 'staff', $2, 'wallet.cash_handover', 'staff_users', $3, $4)`,
       [target.org_id, req.actor!.sub, target.id, JSON.stringify({ amount_ugx: body.amount_ugx, balance_after_ugx: acct.balance_ugx })]
     );
+    const owed = await cashOwed(client, target.id);
     await client.query('COMMIT');
-    res.json({ ok: true, data: { staff_id: target.id, full_name: target.full_name, ...walletView(acct) } });
+    res.json({ ok: true, data: { staff_id: target.id, full_name: target.full_name, ...walletView(acct, owed) } });
   } catch (err) {
     await client.query('ROLLBACK');
     next(err);
@@ -250,8 +299,9 @@ router.post('/:staffId/adjust', requireRole('orgadmin'), async (req: Request, re
        VALUES ($1, 'staff', $2, 'wallet.adjusted', 'staff_users', $3, $4)`,
       [target.org_id, req.actor!.sub, target.id, JSON.stringify(body)]
     );
+    const owed = await cashOwed(client, target.id);
     await client.query('COMMIT');
-    res.json({ ok: true, data: { staff_id: target.id, ...walletView(acct) } });
+    res.json({ ok: true, data: { staff_id: target.id, ...walletView(acct, owed) } });
   } catch (err) {
     await client.query('ROLLBACK');
     next(err);

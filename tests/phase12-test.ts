@@ -138,12 +138,17 @@ async function main() {
       book.status === 201 && book.body?.data?.status === 'requested' && !!book.body?.data?.auto_assign_at,
       'status ' + book.status + ' ' + JSON.stringify(book.body));
 
-    const dupe = await call('POST', '/me/washes', {
+    // A client may have more than one car on the go (owner's call, Oct
+    // 2026): a second booking goes through. Cancelled straight away so the
+    // dispatcher never hands it to a worker the rest of this suite drives.
+    const second = await call('POST', '/me/washes', {
       branch_id: branchId, vehicle_class_id: vcId, service_id: svcId,
     }, client);
-    check('a second booking is refused while the first is still active',
-      dupe.status === 409 && dupe.body?.error?.code === 'ALREADY_REQUESTED',
-      'status ' + dupe.status + ' ' + JSON.stringify(dupe.body));
+    check('a second booking goes through while the first is still active',
+      second.status === 201 && second.body?.data?.status === 'requested',
+      'status ' + second.status + ' ' + JSON.stringify(second.body));
+    const secondCancel = await call('POST', `/me/washes/${second.body?.data?.wash_id}/cancel-request`, undefined, client);
+    check('and can be cancelled while it waits', secondCancel.status === 200, JSON.stringify(secondCancel.body).slice(0, 200));
 
     const queue = await call('GET', '/washes/queue', undefined, joseph);
     const row = (queue.body?.data?.requested || []).find((w: any) => w.id === washId);

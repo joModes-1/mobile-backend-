@@ -91,6 +91,21 @@ async function main() {
     assert(Array.isArray(r.body.data.by_worker), 'by_worker');
   });
 
+  await test('GET /reports/daily?until= → only washes started by that time', async () => {
+    const full = await req('GET', `/api/v1/reports/daily?date=${today}`, OA);
+    const early = await req('GET', `/api/v1/reports/daily?date=${today}&until=00:00`, OA);
+    const late = await req('GET', `/api/v1/reports/daily?date=${today}&until=23:59`, OA);
+    assert(early.status === 200 && late.status === 200, `status ${early.status}/${late.status}`);
+    assert(early.body.data.until === '00:00', 'echoes until');
+    assert(Number(early.body.data.summary.settled_washes) <= Number(full.body.data.summary.settled_washes), 'until 00:00 ≤ full day');
+    assert(Number(late.body.data.summary.gross_ugx) === Number(full.body.data.summary.gross_ugx), 'until 23:59 = full day');
+  });
+
+  await test('GET /reports/daily?until=bad → 400', async () => {
+    r = await req('GET', `/api/v1/reports/daily?date=${today}&until=25:99`, OA);
+    assert(r.status === 400, `expected 400 got ${r.status}`);
+  });
+
   await test('GET /reports/daily empty date → 200 zeros', async () => {
     r = await req('GET', `/api/v1/reports/daily?date=2000-01-01`, OA);
     assert(r.status === 200, `status ${r.status}`);

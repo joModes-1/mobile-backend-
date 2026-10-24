@@ -16,9 +16,10 @@ import { getEnv } from '@/config';
  * made-up name straight away. Nothing here ever throws to the caller: a
  * lookup problem must never stop someone signing up.
  *
- * Providers are only used when their credentials are in the environment, so
- * with none configured every sign-up gets a `user###` name — which is how it
- * runs until the MTN / Airtel keys arrive.
+ * Providers are only used when their credentials are in the environment.
+ * With none configured there is nothing to ask, so a new client is given
+ * PLACEHOLDER_NAME instead (see newClientName) until the MTN / Airtel keys
+ * arrive; resolveName itself still answers `user###` in that case.
  */
 
 export type Network = 'mtn' | 'airtel';
@@ -35,7 +36,7 @@ export interface NameProvider {
 
 export interface NameResult {
   name: string;
-  source: Network | 'generated';
+  source: Network | 'generated' | 'placeholder';
   /** Calls made, per network — for logs and tests. */
   attempts: Partial<Record<Network, number>>;
 }
@@ -112,6 +113,32 @@ export async function resolveName(
   const name = await registeredName(phone, { ...opts, attempts });
   if (name) return { name: name.name, source: name.network, attempts };
   return { name: generatedName(opts.random), source: 'generated', attempts };
+}
+
+/**
+ * Stand-in name for a new client while no MTN / Airtel credentials exist.
+ * Chosen by the owner so the sign-up flow — and the app's "choose account"
+ * step that shows the looked-up name — reads like a real person during
+ * development rather than "user482".
+ */
+export const PLACEHOLDER_NAME = 'Jordan';
+
+/**
+ * The name a brand-new client account gets, as sign-up uses it.
+ *
+ * With no lookup provider configured there is nothing to ask, so it is
+ * PLACEHOLDER_NAME. The moment either network's keys are in the
+ * environment the real lookup runs instead, with its own user### fallback
+ * for numbers neither network knows. Only sign-up uses this: the
+ * withdrawal recipient check (registeredName) never sees the placeholder.
+ */
+export async function newClientName(
+  phone: string,
+  opts: { providers?: NameProvider[]; backoffMs?: number; random?: () => number } = {}
+): Promise<NameResult> {
+  const providers = opts.providers ?? configuredProviders();
+  if (providers.length === 0) return { name: PLACEHOLDER_NAME, source: 'placeholder', attempts: {} };
+  return resolveName(phone, { ...opts, providers });
 }
 
 /**

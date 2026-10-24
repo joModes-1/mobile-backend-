@@ -6,7 +6,7 @@ import { getPool } from '@/db';
 import { signAccessToken, signRefreshToken } from '@/utils/jwt';
 import { createAppError } from '@/middleware/errorHandler';
 import { sendOtpSms, normalizeUgPhone, displayUgPhone } from '@/utils/sms';
-import { resolveName, generatedName } from '@/modules/nameLookup';
+import { newClientName, generatedName } from '@/modules/nameLookup';
 import { getEnv } from '@/config';
 
 const router = Router();
@@ -196,7 +196,8 @@ router.post('/verify', async (req: Request, res: Response, next: NextFunction) =
     }
 
     // A brand-new number becomes a client, and a client never types their
-    // name: it comes from MTN / Airtel, or is made up (modules/nameLookup).
+    // name: it comes from MTN / Airtel, or is made up — a placeholder while
+    // no network keys are configured (modules/nameLookup).
     // Looked up BEFORE the transaction — with retries across two networks
     // it can take seconds, and a transaction must not sit open on a
     // phone company's API.
@@ -210,7 +211,7 @@ router.post('/verify', async (req: Request, res: Response, next: NextFunction) =
         [phone]
       );
       if (known.rows.length === 0) {
-        const result = await resolveName(phone);
+        const result = await newClientName(phone);
         lookedUpName = result.name;
         console.log(`[NAME] new client name from ${result.source}`, result.attempts);
       }
@@ -330,6 +331,9 @@ router.post('/verify', async (req: Request, res: Response, next: NextFunction) =
       `SELECT id, org_id, full_name FROM clients WHERE phone = $1 LIMIT 1`,
       [phone]
     )).rows[0];
+    // Told to the app so it can show the new account (and the name it was
+    // given) before going in; a returning client goes straight to home.
+    const isNew = !row;
 
     if (!row) {
       // Which organisation does a brand-new customer belong to?
@@ -391,9 +395,11 @@ router.post('/verify', async (req: Request, res: Response, next: NextFunction) =
       ok: true,
       data: {
         account_type: 'client',
+        is_new: isNew,
         access_token: accessToken,
         refresh_token: refreshToken,
         full_name: row.full_name,
+        phone: phone,
         phone_display: displayUgPhone(phone),
       },
     });

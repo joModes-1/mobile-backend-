@@ -219,17 +219,19 @@ export async function processSettlement(
 
 // ─── "Wash 2 cars for the price of 1" promo ────────────────────────────
 //
+// One booking, two cars (POST /me/washes/promo): the dearer car is charged
+// and the other is free. Booking it writes the promo_redemptions row with
+// both washes on it, status 'armed'; settling the free car flips it to
+// 'used'. Either way the row existing is what makes the offer one-time.
+//
 // Sits beside the credit mechanism but is deliberately NOT a credit: the
-// client paid full price for wash #1, so the reward is already bought — it
-// must not consume free_wash_credits, and it must not earn a wash_count
-// stamp either (the paid wash #1 already earned its own stamp at its own
-// settlement; counting the free wash too would be two stamps for one
-// payment).
+// client pays full price for the other car, so the free one is already
+// bought — it must not consume free_wash_credits, nor earn a wash_count
+// stamp.
 
 /**
- * Does this client have the offer armed (grabbed, paid wash settled) but
- * not yet spent? Called inside the booking AND settle transactions with
- * FOR UPDATE, so concurrent bookings race safely on the row lock.
+ * Does this client have a booked offer whose free car is not settled yet?
+ * Called inside the settle transaction with FOR UPDATE.
  */
 export async function hasArmedPromo(
   pool: any,
@@ -243,6 +245,53 @@ export async function hasArmedPromo(
     [clientId, promoKey]
   );
   return result.rows.length > 0;
+}
+
+/**
+ * When either car of an offer is cancelled before the free car settles,
+ * the offer is handed back and the other car carries on as an ordinary
+ * booking at its own price:
+ *
+ *  - the paid car cancelled → the free car, if still running, becomes a
+ *    normal paid wash (its price owed, its points earned). Nobody gets a
+ *    free car without paying for one.
+ *  - the free car cancelled → the paid car simply stops being "the offer's".
+ *
+ * Either way the redemption row is deleted, so the client can take the
+ * offer again. Once the free car has settled ('used') nothing is unwound —
+ * the offer was consumed by a wash that happened. Call inside the cancel
+ * transaction, after the wash row is marked cancelled.
+ */
+export async function releasePromoPair(pool: any, cancelledWashId: string): Promise<boolean> {
+  const row = (await pool.query(
+    `SELECT id, started_wash_id, free_wash_id FROM promo_redemptions
+      WHERE (started_wash_id = $1 OR free_wash_id = $1) AND status = 'armed'
+      FOR UPDATE`,
+    [cancelledWashId]
+  )).rows[0];
+  if (!row) return false;
+
+  if (row.started_wash_id === cancelledWashId && row.free_wash_id) {
+    await pool.query(
+      `UPDATE washes w
+          SET is_redemption = false,
+              promo_key = NULL,
+              client_points_to_award = CASE WHEN s.earns_point THEN s.client_points_awarded ELSE 0 END,
+              updated_at = now()
+         FROM services s
+        WHERE w.id = $1 AND s.id = w.service_id
+          AND w.status IN ('requested', 'in_progress', 'ready')`,
+      [row.free_wash_id]
+    );
+  } else if (row.free_wash_id === cancelledWashId && row.started_wash_id) {
+    await pool.query(
+      `UPDATE washes SET promo_key = NULL, updated_at = now() WHERE id = $1`,
+      [row.started_wash_id]
+    );
+  }
+
+  await pool.query(`DELETE FROM promo_redemptions WHERE id = $1`, [row.id]);
+  return true;
 }
 
 /**

@@ -8,14 +8,14 @@
  *  2. The real adapters' requests, with fetch stubbed: the URLs, headers and
  *     number formats MTN and Airtel expect, and how their answers are read.
  *  3. One real sign-up through the API: with no network keys configured
- *     (the local setup), a new client gets a user### name, and signing in
- *     again never renames anyone.
+ *     (the local setup), a new client gets the placeholder name and is told
+ *     it is new; signing in again never renames anyone and is not "new".
  */
 
-import { signInByPhone } from './helpers/auth';
 import {
   resolveName, registeredName, networkFor, toMsisdn, tidyName, generatedName,
   mtnProvider, airtelProvider, NameProvider, Network,
+  newClientName, PLACEHOLDER_NAME,
 } from '../src/modules/nameLookup';
 
 const BASE = process.env.TEST_BASE || 'http://localhost:3456/api/v1';
@@ -192,29 +192,47 @@ async function main() {
     } finally { globalThis.fetch = realFetch; }
   });
 
-  await act('Act 10 — real sign-up through the API', async () => {
-    // A fresh number on the MTN range. With no MTN/Airtel keys in the local
-    // .env, the server must fall through to a generated name.
-    const phone = '+25677' + String(Date.now()).slice(-7);
-    const token = await signInByPhone(phone);
-    const me = await (await fetch(BASE + '/me', { headers: { Authorization: `Bearer ${token}` } })).json() as any;
-    check('new client named user###, never asked', /^user\d{3}$/.test(me?.data?.full_name || ''), JSON.stringify(me?.data?.full_name));
+  await act('Act 10 — the sign-up name: placeholder until keys exist', async () => {
+    const none = await newClientName('0772123456', { providers: [] });
+    check('no providers configured → placeholder name', none.name === PLACEHOLDER_NAME && none.source === 'placeholder', JSON.stringify(none));
+    const mtn = fake('mtn', ['jordan okello']);
+    const real = await newClientName('0772123456', { providers: [mtn.provider], backoffMs: 0 });
+    check('with a provider the real lookup runs', real.name === 'Jordan Okello' && real.source === 'mtn', JSON.stringify(real));
+    const unknown = await newClientName('0772123456', { providers: [fake('mtn', [null]).provider], backoffMs: 0 });
+    check('a provider that does not know the number still gives user###', unknown.source === 'generated', JSON.stringify(unknown));
+  });
 
-    // Signing in again must not rename them.
-    const start = await (await fetch(BASE + '/auth/phone/start', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ phone }),
-    })).json() as any;
-    const again = await (await fetch(BASE + '/auth/phone/verify', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ phone, code: start?.data?.otp_code }),
-    })).json() as any;
+  await act('Act 11 — real sign-up through the API', async () => {
+    // A fresh number on the MTN range. With no MTN/Airtel keys in the local
+    // .env, the server gives the placeholder name.
+    const phone = '+25677' + String(Date.now()).slice(-7);
+    const verifyOnce = async () => {
+      const start = await (await fetch(BASE + '/auth/phone/start', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ phone }),
+      })).json() as any;
+      const res = await (await fetch(BASE + '/auth/phone/verify', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phone, code: start?.data?.otp_code }),
+      })).json() as any;
+      return { code: start?.data?.otp_code, res };
+    };
+
+    const first = await verifyOnce();
+    check('first sign-in creates the account and says so', first.res?.data?.is_new === true, JSON.stringify(first.res).slice(0, 200));
+    const me = await (await fetch(BASE + '/me', { headers: { Authorization: `Bearer ${first.res?.data?.access_token}` } })).json() as any;
+    check('new client given the placeholder name, never asked', me?.data?.full_name === PLACEHOLDER_NAME, JSON.stringify(me?.data?.full_name));
+
+    // Signing in again must not rename them, nor call them new.
+    const second = await verifyOnce();
+    const again = second.res;
+    check('signing in again is not a new account', again?.data?.is_new === false, JSON.stringify(again).slice(0, 200));
     const me2 = await (await fetch(BASE + '/me', { headers: { Authorization: `Bearer ${again?.data?.access_token}` } })).json() as any;
     check('signing in again keeps the same name', me2?.data?.full_name === me?.data?.full_name,
       `${me?.data?.full_name} vs ${me2?.data?.full_name}`);
 
     const reuse = await (await fetch(BASE + '/auth/phone/verify', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ phone, code: start?.data?.otp_code }),
+      body: JSON.stringify({ phone, code: second.code }),
     })).json() as any;
     check('the same code cannot sign in twice', reuse?.ok === false, JSON.stringify(reuse).slice(0, 200));
   });

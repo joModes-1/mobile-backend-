@@ -70,6 +70,7 @@ const AUTH = ['client', 'worker', 'manager', 'orgadmin', 'sysadmin', 'other'];
     // client washes
     ['GET', '/me/washes/active', C], ['GET', '/me/washes/history', C], ['GET', '/me/washes/promo', C],
     ['GET', '/me/washes/prices', C], ['POST', '/me/washes', C, {}],
+    ['GET', '/me/washes/active-list', C], ['POST', '/me/washes/promo', C, {}],
     ['POST', `/me/washes/${DUMMY}/payment-intent`, C, { method: 'cash' }],
     ['POST', `/me/washes/${DUMMY}/cancel-request`, C],
     ['GET', '/me/washes/loyalty', C], ['GET', '/me/washes/loyalty/ledger', C],
