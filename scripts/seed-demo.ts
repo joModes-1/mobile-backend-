@@ -144,6 +144,21 @@ async function main() {
       `SELECT id, code, name FROM branches WHERE org_id = $1 AND code = ANY($2::text[])`,
       [org, Object.keys(DAILY)]
     );
+    // A branch with nobody to wash (a fresh test database) gets two demo workers.
+    for (const b of branches) {
+      const has = (await q(`SELECT 1 FROM staff_users WHERE branch_id = $1 AND role = 'worker' AND status = 'active' LIMIT 1`, [b.id]))[0];
+      if (has) continue;
+      for (const name of ['Allan K.', 'Sarah N.']) {
+        phoneSeq++;
+        await q(
+          `INSERT INTO staff_users (org_id, branch_id, role, full_name, username, phone, status, must_change_password)
+           SELECT $1,$2,'worker',$3,$4,$5,'active',false
+           WHERE NOT EXISTS (SELECT 1 FROM staff_users WHERE username = $4)`,
+          [org, b.id, name, `demo_${b.code.toLowerCase()}_${name.toLowerCase().replace(/[^a-z]/g, '')}`, `+2567002101${String(phoneSeq).padStart(2, '0')}`]
+        );
+      }
+    }
+
     const workersBy = new Map<string, any[]>();
     for (const b of branches) {
       workersBy.set(b.id, await q(
