@@ -1423,6 +1423,7 @@ router.get('/', requireRole('orgadmin', 'manager', 'worker'), async (req: Reques
       SELECT w.id, w.job_no, w.status, w.plate, w.quoted_amount_ugx, w.amount_ugx,
              w.is_redemption, w.started_at, w.wash_done_at, w.settled_at, w.receipt_no,
              w.handover_reason, w.cancel_reason, w.created_at,
+             w.branch_id, w.started_by_worker_id,
              vc.name as vehicle_class_name, svc.name as service_name,
              sw.full_name as started_by_name, stw.full_name as settled_by_name,
              c.full_name as client_name, b.name as branch_name

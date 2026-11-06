@@ -74,7 +74,11 @@ router.get('/daily', requireRole('orgadmin', 'manager'), async (req: Request, re
         COUNT(*) FILTER (WHERE status = 'settled' AND is_redemption) AS redemption_count,
         COALESCE(SUM(quoted_amount_ugx) FILTER (WHERE status = 'settled' AND is_redemption), 0) AS redemption_value_ugx,
         COUNT(*) FILTER (WHERE status = 'settled' AND client_id IS NULL) AS walkin_count,
-        COUNT(*) FILTER (WHERE status = 'settled' AND handover_reason IS NOT NULL) AS handover_count
+        COUNT(*) FILTER (WHERE status = 'settled' AND handover_reason IS NOT NULL) AS handover_count,
+        -- How the money came in: notes a worker took, against mobile money
+        -- that settles itself. Points and free washes are neither.
+        COALESCE(SUM(amount_ugx) FILTER (WHERE status = 'settled' AND payment_method = 'cash'), 0) AS cash_ugx,
+        COALESCE(SUM(amount_ugx) FILTER (WHERE status = 'settled' AND payment_method IN ('mtn', 'airtel')), 0) AS mobile_money_ugx
       FROM washes w
       WHERE w.org_id = $1 ${branchClause} AND w.started_at::date = $${++pIdx}
     `, params);
@@ -113,6 +117,15 @@ router.get('/daily', requireRole('orgadmin', 'manager'), async (req: Request, re
       GROUP BY su.id, su.full_name
     `, params);
 
+    // By hour of the day the car was started — only hours that had one.
+    const byHour = await pool.query(`
+      SELECT EXTRACT(HOUR FROM w.started_at)::int AS hour,
+        COUNT(*) FILTER (WHERE w.status = 'settled') AS settled
+      FROM washes w
+      WHERE w.org_id = $1 ${branchClause} AND w.started_at::date = $${pIdx}
+      GROUP BY 1 ORDER BY 1
+    `, params);
+
     res.json({
       ok: true,
       data: {
@@ -122,6 +135,7 @@ router.get('/daily', requireRole('orgadmin', 'manager'), async (req: Request, re
         by_car_type: byCarType.rows,
         by_service: byService.rows,
         by_worker: byWorker.rows,
+        by_hour: byHour.rows,
       },
     });
   } catch (err) { next(err); }
@@ -305,11 +319,29 @@ router.get('/cash-variance', requireRole('orgadmin', 'manager'), async (req: Req
         AND s.opened_at::date BETWEEN $2 AND $3 ${branchClause}
     `, params);
 
+    // Every counted shift per branch — balanced ones too — so a branch can
+    // read "Expected 270,000 · Counted 270,000 · Balanced".
+    const byBranch = await pool.query(`
+      SELECT b.id AS branch_id, b.name AS branch_name,
+        COUNT(*) AS shifts,
+        COUNT(*) FILTER (WHERE s.variance_ugx <> 0) AS mismatched,
+        COALESCE(SUM(s.expected_cash_ugx), 0) AS expected_ugx,
+        COALESCE(SUM(s.counted_cash_ugx), 0) AS counted_ugx,
+        COALESCE(SUM(s.variance_ugx), 0) AS variance_ugx
+      FROM shifts s
+      JOIN branches b ON s.branch_id = b.id
+      WHERE s.org_id = $1 AND s.status = 'closed' AND s.counted_cash_ugx IS NOT NULL
+        AND s.opened_at::date BETWEEN $2 AND $3 ${branchClause}
+      GROUP BY b.id, b.name
+      ORDER BY b.name
+    `, params);
+
     res.json({
       ok: true,
       data: {
         summary: summary.rows[0],
         shifts: result.rows,
+        branches: byBranch.rows,
       },
     });
   } catch (err) { next(err); }
@@ -352,10 +384,11 @@ router.get('/handovers', requireRole('orgadmin', 'manager'), async (req: Request
     const rates = await pool.query(`
       SELECT su.full_name,
         COUNT(*) FILTER (WHERE w.settled_by_worker_id = su.id AND w.handover_reason IS NOT NULL) AS received,
-        COUNT(*) FILTER (WHERE w.started_by_worker_id = su.id AND w.settled_by_worker_id <> su.id) AS given
+        COUNT(*) FILTER (WHERE w.started_by_worker_id = su.id AND w.handover_reason IS NOT NULL) AS given
       FROM washes w
-      JOIN staff_users su ON su.org_id = w.org_id AND su.role IN ('worker','manager')
-      WHERE w.org_id = $1 AND w.status = 'settled' AND w.started_at::date BETWEEN $2 AND $3 ${branchClause}
+      JOIN staff_users su ON su.id IN (w.started_by_worker_id, w.settled_by_worker_id)
+      WHERE w.org_id = $1 AND w.status = 'settled' AND w.handover_reason IS NOT NULL
+        AND w.started_at::date BETWEEN $2 AND $3 ${branchClause}
       GROUP BY su.id, su.full_name
     `, params);
 
@@ -512,13 +545,15 @@ router.get('/stale', requireRole('orgadmin', 'manager'), async (req: Request, re
 
     // Ready washes past ready_alert_minutes
     const staleReady = await pool.query(`
-      SELECT w.id, w.job_no, w.plate, w.started_at, w.wash_done_at,
+      SELECT w.id, w.job_no, w.plate, w.started_at, w.wash_done_at, w.branch_id,
+        su.full_name AS worker_name, su.phone AS worker_phone,
         EXTRACT(EPOCH FROM (now() - w.wash_done_at)) / 60 AS minutes_ready,
         vc.name AS vehicle_class_name, b.name AS branch_name,
         b.ready_alert_minutes
       FROM washes w
       JOIN vehicle_classes vc ON w.vehicle_class_id = vc.id
       JOIN branches b ON w.branch_id = b.id
+      LEFT JOIN staff_users su ON su.id = w.started_by_worker_id
       WHERE w.org_id = $1 AND w.status = 'ready' AND w.wash_done_at IS NOT NULL
         AND EXTRACT(EPOCH FROM (now() - w.wash_done_at)) / 60 > b.ready_alert_minutes ${branchClause}
       ORDER BY w.wash_done_at ASC
@@ -526,12 +561,14 @@ router.get('/stale', requireRole('orgadmin', 'manager'), async (req: Request, re
 
     // In-progress washes open unusually long (>30 min)
     const longProgress = await pool.query(`
-      SELECT w.id, w.job_no, w.plate, w.started_at,
+      SELECT w.id, w.job_no, w.plate, w.started_at, w.branch_id,
+        su.full_name AS worker_name, su.phone AS worker_phone,
         EXTRACT(EPOCH FROM (now() - w.started_at)) / 60 AS minutes_open,
         vc.name AS vehicle_class_name, b.name AS branch_name
       FROM washes w
       JOIN vehicle_classes vc ON w.vehicle_class_id = vc.id
       JOIN branches b ON w.branch_id = b.id
+      LEFT JOIN staff_users su ON su.id = w.started_by_worker_id
       WHERE w.org_id = $1 AND w.status = 'in_progress'
         AND EXTRACT(EPOCH FROM (now() - w.started_at)) / 60 > 30 ${branchClause}
       ORDER BY w.started_at ASC
@@ -566,8 +603,10 @@ router.get('/exceptions', requireRole('orgadmin', 'manager'), async (req: Reques
       params.push(req.actor!.branch_id);
     }
 
-    // All exception types in one query
+    // All exception types in one query, each with its review if it has one.
     const result = await pool.query(`
+      SELECT x.*, er.outcome AS review_outcome, er.reviewed_at, rv.full_name AS reviewed_by_name
+      FROM (
       SELECT w.id, w.job_no, w.status, w.amount_ugx, w.started_at,
         w.cancel_reason, w.dispute_reason, w.reverse_reason, w.handover_reason,
         w.unverified_reason, w.corrected_at, w.reversed_at, w.disputed_at,
@@ -595,10 +634,59 @@ router.get('/exceptions', requireRole('orgadmin', 'manager'), async (req: Reques
           OR w.handover_reason IS NOT NULL
           OR w.settle_verified = false
         )
-      ORDER BY w.started_at DESC
+      ) x
+      LEFT JOIN exception_reviews er ON er.wash_id = x.id AND er.exception_type = x.exception_type
+      LEFT JOIN staff_users rv ON rv.id = er.reviewed_by
+      ORDER BY x.started_at DESC
     `, params);
 
     res.json({ ok: true, data: result.rows });
+  } catch (err) { next(err); }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// POST /reports/exceptions/review — mark exceptions reviewed or dismissed
+// body: { outcome: 'reviewed' | 'dismissed', items: [{ wash_id, exception_type }] }
+// A manager can only review washes at their own branch.
+// ═══════════════════════════════════════════════════════════════
+
+router.post('/exceptions/review', requireRole('orgadmin', 'manager'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const pool = getPool();
+    const orgId = getOrgId(req.actor!);
+    const outcome = req.body?.outcome;
+    const items: { wash_id: string; exception_type: string }[] = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (outcome !== 'reviewed' && outcome !== 'dismissed') {
+      throw createAppError(400, 'VALIDATION_ERROR', 'outcome must be "reviewed" or "dismissed"');
+    }
+    if (items.length === 0 || items.length > 500) {
+      throw createAppError(400, 'VALIDATION_ERROR', 'Send between 1 and 500 items');
+    }
+    if (items.some((i) => !i || typeof i.wash_id !== 'string' || typeof i.exception_type !== 'string')) {
+      throw createAppError(400, 'VALIDATION_ERROR', 'Each item needs wash_id and exception_type');
+    }
+
+    // Only washes in this org (and, for a manager, this branch) are written.
+    const branchOnly = req.actor!.role === 'manager';
+    const result = await pool.query(`
+      INSERT INTO exception_reviews (org_id, wash_id, exception_type, outcome, reviewed_by)
+      SELECT $1, w.id, i.exception_type, $2, $3
+      FROM jsonb_to_recordset($4::jsonb) AS i(wash_id uuid, exception_type text)
+      JOIN washes w ON w.id = i.wash_id AND w.org_id = $1 ${branchOnly ? 'AND w.branch_id = $5' : ''}
+      ON CONFLICT (wash_id, exception_type)
+        DO UPDATE SET outcome = EXCLUDED.outcome, reviewed_by = EXCLUDED.reviewed_by, reviewed_at = now()
+      RETURNING wash_id
+    `, branchOnly
+      ? [orgId, outcome, req.actor!.sub, JSON.stringify(items), req.actor!.branch_id]
+      : [orgId, outcome, req.actor!.sub, JSON.stringify(items)]);
+
+    await pool.query(
+      `INSERT INTO audit_logs (org_id, actor_type, actor_id, action, entity, entity_id, "after")
+       VALUES ($1, 'staff', $2, $3, 'exception_reviews', NULL, $4)`,
+      [orgId, req.actor!.sub, `exceptions.${outcome}`, JSON.stringify({ count: result.rowCount, items })]
+    );
+
+    res.json({ ok: true, data: { updated: result.rowCount } });
   } catch (err) { next(err); }
 });
 
