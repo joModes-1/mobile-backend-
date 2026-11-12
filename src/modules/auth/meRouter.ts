@@ -34,7 +34,7 @@ router.get('/', authenticate, async (req: Request, res: Response, next: NextFunc
     } else if (actor.type === 'staff') {
       const result = await pool.query(
         `SELECT s.id, s.full_name, s.username, s.email, s.phone, s.role, s.status, s.must_change_password,
-                s.branch_id, s.org_id, b.name as branch_name, o.name as org_name
+                s.branch_id, s.org_id, b.name as branch_name, b.code as branch_code, o.name as org_name
          FROM staff_users s
          LEFT JOIN branches b ON s.branch_id = b.id
          JOIN organizations o ON s.org_id = o.id
