@@ -132,4 +132,26 @@ router.patch('/', authenticate, async (req: Request, res: Response, next: NextFu
   }
 });
 
+/**
+ * PUT /me/duty { on_duty: boolean }
+ * The worker home's "You're on duty" switch. Off means no new cars are
+ * offered or auto-assigned, and this worker no longer holds up the others
+ * under the fewest-jobs rule; cars already being washed stay theirs.
+ */
+router.put('/duty', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const actor = req.actor!;
+    if (actor.type !== 'staff') {
+      next(createAppError(403, 'FORBIDDEN', 'Only staff have a duty switch'));
+      return;
+    }
+    if (typeof req.body?.on_duty !== 'boolean') {
+      next(createAppError(400, 'VALIDATION_ERROR', 'on_duty must be true or false'));
+      return;
+    }
+    await getPool().query(`UPDATE staff_users SET on_duty = $2 WHERE id = $1`, [actor.sub, req.body.on_duty]);
+    res.json({ ok: true, data: { on_duty: req.body.on_duty } });
+  } catch (err) { next(err); }
+});
+
 export default router;

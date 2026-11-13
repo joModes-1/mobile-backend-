@@ -8,7 +8,10 @@ import { processSettlement, ensureAccount, hasArmedPromo, redeemPromo, releasePr
 import { awardForSettlement as awardWorkerPoints } from '@/modules/workerPoints';
 import { awardForSettlement as awardClientPoints, refundForWash as refundClientPoints } from '@/modules/clientPoints';
 import { commissionFor, recordSettlement as recordWalletSettlement } from '@/modules/wallet';
-import { acceptCheck, requiredPointsFor, dispatchOverdue, getConfig as getDispatchConfig } from '@/modules/dispatch';
+import {
+  acceptCheck, requiredPointsFor, dispatchOverdue, getConfig as getDispatchConfig,
+  onSiteWorkers, recordOffers, markOfferTaken, offerStats,
+} from '@/modules/dispatch';
 import { notify } from '@/modules/notify';
 import { generateReceiptNo } from '@/utils/receiptNo';
 
@@ -409,6 +412,35 @@ router.get('/queue', requireRole('orgadmin', 'manager', 'worker'), async (req: R
     const orgId = getOrgId(req.actor!);
     const dispatchCfg = await getDispatchConfig(pool, orgId);
     const rule = await acceptCheck(pool, { staffId: req.actor!.sub, role: req.actor!.role ?? '', branchId, orgId });
+
+    // The worker home's extras: who else is on duty, this worker's offer
+    // history for today, and the cars they finished today.
+    const isWorker = req.actor!.role === 'worker';
+    const onDuty = !rule.offDuty;
+    const onSite = await onSiteWorkers(pool, branchId, dispatchCfg.presence_minutes);
+    const iAmOnSite = onSite.some((w) => w.worker_id === req.actor!.sub);
+    const workersOnline = onSite.length + (isWorker && onDuty && !iAmOnSite ? 1 : 0);
+    const othersSeeing = Math.max(0, workersOnline - (isWorker && onDuty ? 1 : 0));
+    let stats: { offers_today: number; taken_today: number; avg_take_seconds: number | null } | null = null;
+    let doneToday: any[] = [];
+    if (isWorker) {
+      // First sight of a job starts this worker's "time to take" clock.
+      if (onDuty) await recordOffers(pool, req.actor!.sub, requestedResult.rows.map((r) => r.id));
+      stats = await offerStats(pool, req.actor!.sub);
+      const done = await pool.query(
+        `SELECT w.id, w.job_no, w.plate, w.amount_ugx, w.settled_at, w.worker_points_to_award,
+                vc.name AS vehicle_class_name, s.name AS service_name
+           FROM washes w
+           JOIN vehicle_classes vc ON vc.id = w.vehicle_class_id
+           JOIN services s ON s.id = w.service_id
+          WHERE w.branch_id = $1 AND w.started_by_worker_id = $2 AND w.status = 'settled'
+            AND w.settled_at >= (date_trunc('day', now() AT TIME ZONE 'Africa/Nairobi') AT TIME ZONE 'Africa/Nairobi')
+          ORDER BY w.settled_at ASC`,
+        [branchId, req.actor!.sub]
+      );
+      doneToday = done.rows;
+    }
+
     const requested = requestedResult.rows.map((r) => {
       const waited = (Date.now() - new Date(r.requested_at).getTime()) / 1000;
       return {
@@ -417,18 +449,22 @@ router.get('/queue', requireRole('orgadmin', 'manager', 'worker'), async (req: R
         auto_assign_at: new Date(new Date(r.requested_at).getTime() + dispatchCfg.accept_window_seconds * 1000),
         seconds_left: Math.max(0, Math.ceil(dispatchCfg.accept_window_seconds - waited)),
         can_accept: rule.allowed,
+        others_seeing: othersSeeing,
       };
     });
 
     res.json({
       ok: true,
       data: {
-        washing, ready, requested,
+        washing, ready, requested, done_today: doneToday,
         dispatch: {
           accept_window_seconds: dispatchCfg.accept_window_seconds,
           my_jobs: rule.myJobs,
           fewest_jobs_on_site: rule.fewestJobs,
           can_accept: rule.allowed,
+          on_duty: onDuty,
+          workers_online: workersOnline,
+          stats,
         },
       },
     });
@@ -473,6 +509,11 @@ router.post('/:id/accept', requireRole('orgadmin', 'manager', 'worker'), async (
     const rule = await acceptCheck(client, {
       staffId: workerId, role: req.actor!.role ?? '', branchId, orgId: getOrgId(req.actor!),
     });
+    if (rule.offDuty) {
+      await client.query('ROLLBACK');
+      next(createAppError(409, 'OFF_DUTY', 'You are off duty. Switch duty back on to take cars.'));
+      return;
+    }
     if (!rule.allowed) {
       await client.query('ROLLBACK');
       next(createAppError(409, 'WORKER_BUSY',
@@ -527,6 +568,7 @@ router.post('/:id/accept', requireRole('orgadmin', 'manager', 'worker'), async (
       return;
     }
 
+    await markOfferTaken(client, workerId, claimed.rows[0].id);
     await client.query('COMMIT');
     const wash = claimed.rows[0];
     // Reuses wash_started rather than adding a near-duplicate event: from

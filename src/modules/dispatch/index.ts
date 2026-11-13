@@ -67,7 +67,7 @@ export async function onSiteWorkers(db: Db, branchId: string, presenceMinutes: n
        JOIN staff_users su ON su.id = s.worker_id
        LEFT JOIN worker_points_accounts a ON a.staff_id = s.worker_id
       WHERE s.branch_id = $1 AND s.status = 'open'
-        AND su.role = 'worker' AND su.status = 'active'
+        AND su.role = 'worker' AND su.status = 'active' AND su.on_duty
         AND su.last_seen_at > now() - make_interval(mins => $2)`,
     [branchId, presenceMinutes]
   );
@@ -93,13 +93,17 @@ export function requiredPointsFor(_wash: { quoted_amount_ugx?: number; vehicle_c
 export async function acceptCheck(
   db: Db,
   opts: { staffId: string; role: string; branchId: string; orgId: string }
-): Promise<{ allowed: boolean; myJobs: number; fewestJobs: number | null }> {
+): Promise<{ allowed: boolean; myJobs: number; fewestJobs: number | null; offDuty?: boolean }> {
   const mine = await db.query(
     `SELECT COUNT(*)::int AS n FROM washes WHERE started_by_worker_id = $1 AND status = 'in_progress'`,
     [opts.staffId]
   );
   const myJobs: number = mine.rows[0].n;
   if (opts.role !== 'worker') return { allowed: true, myJobs, fewestJobs: null };
+
+  // A worker who switched "You're on duty" off is not offered new cars.
+  const duty = await db.query(`SELECT on_duty FROM staff_users WHERE id = $1`, [opts.staffId]);
+  if (duty.rows[0] && duty.rows[0].on_duty === false) return { allowed: false, myJobs, fewestJobs: null, offDuty: true };
 
   const cfg = await getConfig(db, opts.orgId);
   const others = (await onSiteWorkers(db, opts.branchId, cfg.presence_minutes))
@@ -212,4 +216,49 @@ export async function dispatchOverdue(db: Db, opts: { branchId?: string } = {}):
     }
   }
   return { assigned, alerted };
+}
+
+/** Start of today in Kampala, as a timestamp the queries below can compare against. */
+const TODAY_START = `(date_trunc('day', now() AT TIME ZONE 'Africa/Nairobi') AT TIME ZONE 'Africa/Nairobi')`;
+
+/**
+ * Note that these workers' apps were shown these jobs. One row per job and
+ * worker, written the first time only — it is the start of the "time to
+ * take" clock. Only workers who can be offered a job (on duty) get a row.
+ */
+export async function recordOffers(db: Db, staffId: string, washIds: string[]): Promise<void> {
+  if (washIds.length === 0) return;
+  await db.query(
+    `INSERT INTO dispatch_offers (wash_id, staff_id)
+     SELECT unnest($2::uuid[]), $1
+     ON CONFLICT (wash_id, staff_id) DO NOTHING`,
+    [staffId, washIds]
+  );
+}
+
+/** The worker took the job: stop the clock. */
+export async function markOfferTaken(db: Db, staffId: string, washId: string): Promise<void> {
+  await db.query(
+    `UPDATE dispatch_offers SET taken_at = now()
+      WHERE wash_id = $1 AND staff_id = $2 AND taken_at IS NULL`,
+    [washId, staffId]
+  );
+}
+
+/** "Offers taken today 5 of 6" and "Average time to take 11 seconds". */
+export async function offerStats(db: Db, staffId: string): Promise<{ offers_today: number; taken_today: number; avg_take_seconds: number | null }> {
+  const r = await db.query(
+    `SELECT COUNT(*)::int AS offers,
+            COUNT(taken_at)::int AS taken,
+            AVG(EXTRACT(EPOCH FROM (taken_at - first_seen_at))) FILTER (WHERE taken_at IS NOT NULL) AS avg_take
+       FROM dispatch_offers
+      WHERE staff_id = $1 AND first_seen_at >= ${TODAY_START}`,
+    [staffId]
+  );
+  const row = r.rows[0] || {};
+  return {
+    offers_today: Number(row.offers || 0),
+    taken_today: Number(row.taken || 0),
+    avg_take_seconds: row.avg_take == null ? null : Math.round(Number(row.avg_take)),
+  };
 }
