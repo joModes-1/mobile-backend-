@@ -15,6 +15,10 @@
  *
  * Runs against localhost only, unless given --remote (for the hosted test
  * server; it also tidies that org's stale test cars and old unhanded cash).
+ * --happy: a demo-day picture with none of the planted problems — no stuck
+ * car, dispute, cancellation, short shift, unverified payment or overnight
+ * cash — and a business growing over the month.
+ *
  * Everything it writes is tagged, and a re-run removes the previous demo
  * data first, so it can be run again any day to bring "today" up to date.
  * Money moves through the wallet module itself, so cash owed and handovers
@@ -28,6 +32,7 @@ import { awardForSettlement as awardClientPoints } from '../src/modules/clientPo
 import { awardForSettlement as awardWorkerPoints } from '../src/modules/workerPoints';
 
 const TAG = 'demo-seed';
+const HAPPY = process.argv.includes('--happy');
 const ORG_ADMIN_PHONE = '+256700200001';
 /** Test client logins: each gets a run of its own washes and points. */
 const TEST_CLIENT_PHONES = ['+256700123456', '+256700200099'];
@@ -304,7 +309,8 @@ async function main() {
       for (const b of branches) {
         const workers = workersBy.get(b.id) || [];
         if (workers.length === 0) continue;
-        const n = Math.round(DAILY[b.code] * dayFactor * rnd(0.82, 1.18) * shareOfDay);
+        const growth = HAPPY ? 0.78 + 0.4 * ((29 - d) / 29) : 1;
+        const n = Math.round(DAILY[b.code] * dayFactor * (HAPPY ? rnd(0.95, 1.12) : rnd(0.82, 1.18)) * growth * shareOfDay);
         const cashBy = new Map<string, number>();
         for (let i = 0; i < n; i++) {
           const worker = pick(workers);
@@ -314,13 +320,13 @@ async function main() {
           const shiftId = await shift(b.id, worker.id, day, isToday);
           const r = Math.random();
           // The odd cancellation; a dispute or a payment without the app only now and then this week.
-          if (r < 0.01) { await insertWash({ branch: b, worker, day, startedAt: start, status: 'cancelled', shiftId }); continue; }
-          if (d <= 2 && r < 0.0115) {
+          if (!HAPPY && r < 0.01) { await insertWash({ branch: b, worker, day, startedAt: start, status: 'cancelled', shiftId }); continue; }
+          if (!HAPPY && d <= 2 && r < 0.0115) {
             await insertWash({ branch: b, worker, day, startedAt: start, washDoneAt: done, settledAt: settled, status: 'disputed', method: 'cash', shiftId, dispute: pick(['Customer says it was paid by mobile money', 'Charged for SUV, car is a saloon']) });
             continue;
           }
           const m = method();
-          const row = await insertWash({ branch: b, worker, day, startedAt: start, washDoneAt: done, settledAt: settled, status: 'settled', method: m, shiftId, unverified: d <= 6 && r > 0.996 });
+          const row = await insertWash({ branch: b, worker, day, startedAt: start, washDoneAt: done, settledAt: settled, status: 'settled', method: m, shiftId, unverified: !HAPPY && d <= 6 && r > 0.996 });
           if (m === 'cash') {
             cashBy.set(worker.id, (cashBy.get(worker.id) || 0) + Number(row.amount_ugx));
             if (isToday) cashToday.push({ washId: row.id, workerId: worker.id, amount: Number(row.amount_ugx) });
@@ -332,7 +338,7 @@ async function main() {
           for (const [workerId, expected] of cashBy) {
             const sid = shiftFor.get(`${workerId}:${isoDate(day)}`);
             let variance = 0;
-            if (d <= 6 && Math.random() < 0.04) variance = pick([-5000, -2000, 2000, 5000]);
+            if (!HAPPY && d <= 6 && Math.random() < 0.04) variance = pick([-5000, -2000, 2000, 5000]);
             await q(
               `UPDATE shifts SET expected_cash_ugx = $2, counted_cash_ugx = $3, variance_ugx = $4, closed_by = $5 WHERE id = $1`,
               [sid, expected, expected + variance, variance, admin]
@@ -343,7 +349,7 @@ async function main() {
     }
 
     // Always one dispute to test with: yesterday afternoon at the first branch.
-    {
+    if (!HAPPY) {
       const b = branches.find((x) => x.code === 'NTD') || branches[0];
       const worker = pick(workersBy.get(b.id) || []);
       if (worker) {
@@ -371,7 +377,7 @@ async function main() {
       const byWorker = new Map<string, number>();
       rows.forEach((x) => byWorker.set(x.workerId, (byWorker.get(x.workerId) || 0) + x.amount));
       // One person keeps yesterday's cash: the 'holds cash since…' alert, once.
-      if (day === 1) [...byWorker.entries()].filter(([, a]) => a >= 40000).slice(0, 1).forEach(([id]) => keepers.add(id));
+      if (day === 1 && !HAPPY) [...byWorker.entries()].filter(([, a]) => a >= 40000).slice(0, 1).forEach(([id]) => keepers.add(id));
       const evening = new Date(now);
       evening.setDate(now.getDate() - day);
       let i = 0;
@@ -394,7 +400,7 @@ async function main() {
     let h = 0;
     for (const id of holders) {
       const amt = todayOwed.get(id) || 0;
-      if (amt < 20000 || h >= handTimes.length || Math.random() < 0.2) continue;
+      if (amt < 20000 || h >= handTimes.length || Math.random() < (HAPPY ? 0.1 : 0.2)) continue;
       const [hh, mm] = handTimes[h].split(':').map(Number);
       const when = at(now, hh, mm);
       if (when > now) continue;
@@ -420,7 +426,7 @@ async function main() {
     };
     const B = (code: string) => branches.find((x) => x.code === code);
     for (const [code, ago] of [['NTD', 18], ['BGL', 9], ['NJR', 22], ['KRK', 4], ['KBL', 12], ['NTD', 6], ['KRK', 15]] as const) await live(B(code), ago, 'in_progress');
-    await live(B('NTD'), 52, 'in_progress'); // the one stuck car
+    if (!HAPPY) await live(B('NTD'), 52, 'in_progress'); // the one stuck car
     await live(B('KBL'), 40, 'ready', 18);
     await live(B('BGL'), 30, 'ready', 6);
     await live(B('NJR'), 7, 'requested');
